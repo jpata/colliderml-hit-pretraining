@@ -1,279 +1,176 @@
+
 """
 Dataset definitions for Calorimeter Hits.
+Uses IterableDataset for efficient chunked loading and worker partitioning.
+Memory optimized to avoid OOM by using smaller chunks.
 """
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset, get_worker_info
 import numpy as np
-import matplotlib.pyplot as plt
 import os
 import time
 import polars as pl
-from colliderml.core import load_tables
+from pathlib import Path
 
-class CalorimeterDataset(Dataset):
-    def __init__(self, num_hits=2048, max_events=None, verbose=False):
+class CalorimeterDataset(IterableDataset):
+    def __init__(self, num_hits=2048, max_events=None, verbose=False, chunk_size=10):
         self.verbose = verbose
-        start_time = time.time()
-        cfg = {
-            "dataset_id": "CERN/ColliderML-Release-1",
-            "channels": "ttbar",
-            "pileup": "pu0",
-            "objects": ["particles", "tracker_hits", "calo_hits", "tracks"],
-            "split": "train",
-            "lazy": True,
-            "max_events": max_events,
-        }
-        if self.verbose:
-            print(f"Loading data from ColliderML (max_events={max_events}, lazy=True)...")
-        
-        self.frames = load_tables(cfg)
-        
-        if self.verbose:
-            print(f"Tables metadata loaded in {time.time() - start_time:.2f}s")
-            count_start = time.time()
-
-        # Collect data into memory to avoid repeated slow lazy fetches in __getitem__
-        for key in ["calo_hits", "tracker_hits"]:
-            if key in self.frames and isinstance(self.frames[key], pl.LazyFrame):
-                if self.verbose:
-                    print(f"Collecting {key} into memory...")
-                self.frames[key] = self.frames[key].collect()
-
-        # Each row in calo_hits is one event, so the number of rows is the number of events.
-        self.num_events = self.frames["calo_hits"].height
-        
-        if self.verbose:
-            print(f"Data collected in {time.time() - count_start:.2f}s")
-            print(f"Total initialization time: {time.time() - start_time:.2f}s")
-
         self.num_hits = num_hits
+        self.max_events = max_events
+        self.chunk_size = chunk_size
         
-        # Pre-calculated normalization constants (approximate)
+        # Identify shards dynamically from cache
+        cache_root = Path("~/.cache/colliderml").expanduser()
+        self.shard_dir = cache_root / "CERN__ColliderML-Release-1/ttbar_pu0_calo_hits/data/ttbar_pu0_calo_hits"
+        
+        if not self.shard_dir.exists():
+            raise FileNotFoundError(f"Shard directory {self.shard_dir} not found.")
+        
+        self.shards = sorted(list(self.shard_dir.glob("train-*.parquet")))
+        if not self.shards:
+            raise FileNotFoundError(f"No parquet shards found in {self.shard_dir}")
+
+        self.rows_per_shard = 1000
         self.coord_scale = 5000.0
-        self.energy_scale = 0.1
+        self.required_cols = ["x", "y", "z", "total_energy"]
 
-    def __len__(self):
-        return self.num_events
+    def _process_chunk(self, df):
+        """Processes a chunk of events into a list of hit arrays."""
+        # Check if empty
+        if df.height == 0:
+            return []
+            
+        # 1. Get offsets for each event
+        lengths = df["x"].list.len().to_numpy()
+        offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(lengths)
+        
+        # 2. Explode to get flat representation
+        flat_df = df.explode(self.required_cols)
+        
+        # 3. Extract columns as numpy arrays directly
+        x = flat_df["x"].to_numpy().astype(np.float32) / self.coord_scale
+        y = flat_df["y"].to_numpy().astype(np.float32) / self.coord_scale
+        z = flat_df["z"].to_numpy().astype(np.float32) / self.coord_scale
+        e = np.log10(flat_df["total_energy"].to_numpy().astype(np.float32) + 1.0)
+        
+        flat_hits = np.stack([x, y, z, e], axis=1)
+        
+        events = []
+        for i in range(len(lengths)):
+            events.append(flat_hits[offsets[i]:offsets[i+1]])
+        return events
 
-    def __getitem__(self, idx):
-        start_time = time.time() if self.verbose else None
-        # Fetch only the requested event (row) from the memory frame
-        event = self.frames["calo_hits"].slice(idx, 1)
+    def __iter__(self):
+        worker_info = get_worker_info()
+        if worker_info is None:
+            shards = self.shards
+        else:
+            # Partition shards among workers
+            shards = self.shards[worker_info.id::worker_info.num_workers]
+            
+        events_yielded = 0
         
-        if self.verbose:
-            fetch_time = time.time() - start_time
-            process_start = time.time()
+        for shard_path in shards:
+            if self.verbose:
+                print(f"Worker {os.getpid()} processing shard {shard_path.name}")
+            
+            # Read metadata to get row count if not 1000
+            # For now assume 1000 as per previous checks
+            
+            for start in range(0, self.rows_per_shard, self.chunk_size):
+                if self.max_events and events_yielded >= self.max_events:
+                    return
+                
+                # Load a chunk of events eagerly to avoid overhead of many small scans
+                num_to_load = min(self.chunk_size, self.rows_per_shard - start)
+                
+                # Using read_parquet with row_count and n_rows for efficiency if possible
+                # But slice is fine for local parquet.
+                try:
+                    chunk_df = pl.read_parquet(
+                        shard_path, 
+                        columns=self.required_cols,
+                        # No direct slice in read_parquet, but we can use use_pyarrow or just scan
+                    )
+                    chunk_df = chunk_df.slice(start, num_to_load)
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Error reading shard {shard_path}: {e}")
+                    break
+                
+                # Process chunk into list of arrays
+                raw_events = self._process_chunk(chunk_df)
+                
+                # Yield each event
+                for raw_hits in raw_events:
+                    if self.max_events and events_yielded >= self.max_events:
+                        return
+                        
+                    processed = self._finalize_event(raw_hits, events_yielded)
+                    yield processed
+                    events_yielded += 1
 
-        # Extract features (x, y, z, total_energy) and flatten if they are list columns
-        x = np.concatenate(event["x"].to_numpy()) / self.coord_scale
-        y = np.concatenate(event["y"].to_numpy()) / self.coord_scale
-        z = np.concatenate(event["z"].to_numpy()) / self.coord_scale
-        e = np.log10(np.concatenate(event["total_energy"].to_numpy()) + 1.0)
-        
-        # Combine into a single hit array (N, 4)
-        hits = np.stack([x, y, z, e], axis=1).astype(np.float32)
-        
-        # Fixed-size sampling/padding for batching
+    def _finalize_event(self, hits, event_idx):
         n_hits = hits.shape[0]
+        rng = np.random.default_rng(seed=event_idx)
+        
         if n_hits >= self.num_hits:
-            # Randomly sample num_hits
-            indices = np.random.choice(n_hits, self.num_hits, replace=False)
+            indices = rng.choice(n_hits, self.num_hits, replace=False)
             hits = hits[indices]
         else:
-            # Pad with zeros
             padding = np.zeros((self.num_hits - n_hits, 4), dtype=np.float32)
             hits = np.concatenate([hits, padding], axis=0)
             
-        if self.verbose:
-            print(f"__getitem__({idx}): fetch={fetch_time:.4f}s, process={time.time() - process_start:.4f}s")
-
         return torch.from_numpy(hits)
 
     def get_full_event(self, idx):
-        """Returns all calo and tracker hits for a given event index."""
-        calo_event = self.frames["calo_hits"].slice(idx, 1)
-        event_id = calo_event["event_id"][0]
+        """Sparse access for visualization only."""
+        shard_idx = idx // self.rows_per_shard
+        rel_idx = idx % self.rows_per_shard
+        shard_path = self.shards[shard_idx]
         
-        # Get tracker hits for the same event
-        tracker_frames = self.frames["tracker_hits"]
-        # Filter tracker hits by event_id
-        tracker_event = tracker_frames.filter(pl.col("event_id") == event_id)
+        df = pl.read_parquet(shard_path, columns=self.required_cols).slice(rel_idx, 1)
         
-        def process_hits(df, is_tracker=False):
-            if len(df) == 0:
-                return np.zeros((0, 4), dtype=np.float32)
-            x = np.concatenate(df["x"].to_numpy()) / self.coord_scale
-            y = np.concatenate(df["y"].to_numpy()) / self.coord_scale
-            z = np.concatenate(df["z"].to_numpy()) / self.coord_scale
-            if "total_energy" in df.columns:
-                e = np.log10(np.concatenate(df["total_energy"].to_numpy()) + 1.0)
-            else:
-                # Assign a small dummy energy for tracker hits if missing
-                e = np.ones_like(x) * 0.01 
-            return np.stack([x, y, z, e], axis=1).astype(np.float32)
-
-        calo_hits = process_hits(calo_event)
-        tracker_hits = process_hits(tracker_event, is_tracker=True)
+        x = np.concatenate(df["x"].to_numpy()) / self.coord_scale
+        y = np.concatenate(df["y"].to_numpy()) / self.coord_scale
+        z = np.concatenate(df["z"].to_numpy()) / self.coord_scale
+        e = np.log10(np.concatenate(df["total_energy"].to_numpy()) + 1.0)
+        hits = np.stack([x, y, z, e], axis=1).astype(np.float32)
         
         return {
-            "event_id": event_id,
-            "calo_hits": calo_hits,
-            "tracker_hits": tracker_hits
+            "event_id": idx,
+            "calo_hits": hits,
+            "tracker_hits": np.zeros((0, 4), dtype=np.float32)
         }
 
-
-
 class NeighborhoodCalorimeterDataset(CalorimeterDataset):
-    """
-    Dataset that samples a 'neighborhood' around a randomly selected seed hit.
-    This is better for learning local correlations in large events.
-    """
-    def __init__(self, num_hits=256, max_events=None, verbose=False):
-        super().__init__(num_hits=num_hits, max_events=max_events, verbose=verbose)
-        if self.verbose:
-            print(f"Loading data for NeighborhoodDataset (max_events={max_events})...")
-
-    def __getitem__(self, idx):
-        start_time = time.time() if self.verbose else None
-        # Fetch only the requested event (row) from the memory frame
-        event = self.frames["calo_hits"].slice(idx, 1)
-        
-        if self.verbose:
-            fetch_time = time.time() - start_time
-            process_start = time.time()
-
-        x = np.concatenate(event["x"].to_numpy()) / self.coord_scale
-        y = np.concatenate(event["y"].to_numpy()) / self.coord_scale
-        z = np.concatenate(event["z"].to_numpy()) / self.coord_scale
-        e = np.log10(np.concatenate(event["total_energy"].to_numpy()) + 1.0)
-        
-        hits = np.stack([x, y, z, e], axis=1).astype(np.float32)
+    def _finalize_event(self, hits, event_idx):
         n_hits = hits.shape[0]
-        
+        rng = np.random.default_rng(seed=event_idx)
+
         if n_hits <= self.num_hits:
-            # If event is small, pad as usual
             padding = np.zeros((self.num_hits - n_hits, 4), dtype=np.float32)
             result = torch.from_numpy(np.concatenate([hits, padding], axis=0))
         else:
-            # 1. Select a random 'seed' hit (weighted by energy to focus on showers)
+            e = hits[:, 3]
             probs = e / (e.sum() + 1e-9)
-            seed_idx = np.random.choice(n_hits, p=probs)
+            seed_idx = rng.choice(n_hits, p=probs)
             seed_pos = hits[seed_idx, :3]
             
-            # 2. Find nearest neighbors
             dists = np.sum((hits[:, :3] - seed_pos)**2, axis=1)
-            neighbor_indices = np.argsort(dists)[:self.num_hits]
+            neighbor_indices = np.argpartition(dists, self.num_hits)[:self.num_hits]
+            neighbor_indices = neighbor_indices[np.argsort(dists[neighbor_indices])]
+            
             result = torch.from_numpy(hits[neighbor_indices])
             
-        if self.verbose:
-            print(f"Neighborhood __getitem__({idx}): fetch={fetch_time:.4f}s, process={time.time() - process_start:.4f}s")
-
         return result
 
-def validate_dataset(max_events=100, output_dir="validation_plots", verbose=True):
-    """
-    Validates the dataset by plotting distributions and printing a summary.
-    """
-    dataset = CalorimeterDataset(num_hits=2048, max_events=max_events, verbose=verbose)
-    num_events = len(dataset)
-    
-    print("\nCollecting data for validation plots...")
-    start_time = time.time()
-    calo_frames = dataset.frames["calo_hits"]
-    if isinstance(calo_frames, pl.LazyFrame):
-        calo_frames = calo_frames.collect()
-        
-    tracker_frames = dataset.frames["tracker_hits"]
-    if isinstance(tracker_frames, pl.LazyFrame):
-        tracker_frames = tracker_frames.collect()
-    
-    print(f"Data collection took {time.time() - start_time:.2f}s")
-    
-    # Multiplicities per event
-    if isinstance(calo_frames, pl.DataFrame):
-        # Multiplicity is the length of the list columns since each row is one event
-        calo_multiplicities = calo_frames["total_energy"].list.len().to_numpy()
-        tracker_multiplicities = tracker_frames["x"].list.len().to_numpy()
-    else:
-        raise ValueError("calo_frames must be a Polars DataFrame for validation.")
-
-    # Collect energy values
-    def flatten_column(df, col_name):
-        series = df[col_name]
-        import polars as pl
-        if isinstance(series.dtype, pl.List):
-            return np.concatenate(series.to_list())
-        return series.to_numpy()
-
-    calo_energies = flatten_column(calo_frames, "total_energy")
-    
-    tracker_energies = None
-    if "total_energy" in tracker_frames.columns:
-        tracker_energies = flatten_column(tracker_frames, "total_energy")
-
-    print("\n--- Dataset Summary ---")
-    print(f"Number of events: {num_events}")
-    print(f"Avg Calo hits per event: {np.mean(calo_multiplicities):.2f}")
-    print(f"Avg Tracker hits per event: {np.mean(tracker_multiplicities):.2f}")
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    axes = axes.flatten()
-    features = ['x', 'y', 'z', 'total_energy']
-    for i, feat in enumerate(features):
-        data = flatten_column(calo_frames, feat)
-        if feat in ['x', 'y', 'z']:
-            data = data / dataset.coord_scale
-        else:
-            data = np.log10(data + 1.0)
-            
-        axes[i].hist(data, bins=50, color='skyblue', edgecolor='black')
-        axes[i].set_title(f'Calo Hit Distribution: {feat}')
-        axes[i].set_xlabel('Normalized Value' if feat != 'total_energy' else 'Log10(1 + Energy)')
-        axes[i].set_ylabel('Frequency')
-        axes[i].grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "calo_feature_distributions.png"))
-    plt.close()
-
-    plt.figure(figsize=(10, 6))
-    plt.hist(calo_multiplicities, bins=30, alpha=0.5, label='Calo Hits', color='blue', edgecolor='black')
-    plt.hist(tracker_multiplicities, bins=30, alpha=0.5, label='Tracker Hits', color='green', edgecolor='black')
-    plt.title('Hit Multiplicity per Event')
-    plt.xlabel('Number of Hits')
-    plt.ylabel('Frequency')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, "multiplicity_distributions.png"))
-    plt.close()
-
-    plt.figure(figsize=(10, 6))
-    plt.hist(calo_energies, bins=50, color='salmon', edgecolor='black')
-    plt.title('Calo Hit Energy Distribution')
-    plt.xlabel('Energy')
-    plt.ylabel('Frequency')
-    plt.yscale('log')
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, "calo_energy_distribution.png"))
-    plt.close()
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    tracker_coords = ['x', 'y', 'z']
-    for i, feat in enumerate(tracker_coords):
-        data = flatten_column(tracker_frames, feat)
-        data = data / dataset.coord_scale
-        axes[i].hist(data, bins=50, color='lightgreen', edgecolor='black')
-        axes[i].set_title(f'Tracker Hit Distribution: {feat}')
-        axes[i].set_xlabel('Normalized Value')
-        axes[i].set_ylabel('Frequency')
-        axes[i].grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "tracker_feature_distributions.png"))
-    plt.close()
-
-    print(f"\nValidation plots saved to {output_dir}/")
-
 if __name__ == "__main__":
-    validate_dataset(max_events=50)
+    ds = CalorimeterDataset(num_hits=1024, max_events=50, verbose=True)
+    start = time.time()
+    for i, event in enumerate(ds):
+        if i % 10 == 0:
+            print(f"Yielded event {i}, time since last: {time.time()-start:.4f}s")
+            start = time.time()

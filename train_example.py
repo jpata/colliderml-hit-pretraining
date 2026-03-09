@@ -240,17 +240,16 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
 
     # Dataset Selection
     if use_neighborhood:
-        full_dataset = NeighborhoodCalorimeterDataset(num_hits=num_hits, max_events=max_events, verbose=False)
+        train_dataset = NeighborhoodCalorimeterDataset(num_hits=num_hits, max_events=max_events, verbose=False)
+        val_dataset = NeighborhoodCalorimeterDataset(num_hits=num_hits, max_events=100, verbose=False) # Small fixed val
     else:
-        full_dataset = CalorimeterDataset(num_hits=num_hits, max_events=max_events, verbose=False)
+        train_dataset = CalorimeterDataset(num_hits=num_hits, max_events=max_events, verbose=False)
+        val_dataset = CalorimeterDataset(num_hits=num_hits, max_events=100, verbose=False) # Small fixed val
     
-    # Split into train and validation
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
-    
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    # For IterableDataset, shuffle MUST be handled inside the dataset or by not using it in DataLoader.
+    # Worker partitioning is handled in the dataset's __iter__.
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=4, prefetch_factor=2)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, num_workers=0)
     
     model = MaskedPointModel(embed_dim=embed_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -285,7 +284,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             pbar.set_postfix(loss=loss.item())
         
         scheduler.step()
-        avg_train_loss = total_train_loss / len(train_dataloader)
+        num_batches = i + 1
+        avg_train_loss = total_train_loss / num_batches
         print(f"Epoch {epoch+1} Average Train Loss: {avg_train_loss:.6f}")
 
         # Validation phase with Density Analysis
@@ -296,7 +296,9 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         with torch.no_grad():
             total_coord_loss = 0
             total_energy_loss = 0
+            v_batches = 0
             for batch_hits in val_dataloader:
+                v_batches += 1
                 batch_hits = batch_hits.to(device)
                 reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=mask_ratio)
                 
@@ -329,9 +331,9 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 # Global val loss
                 total_val_loss += loss.item()
         
-        avg_val_loss = total_val_loss / len(val_dataloader)
-        avg_coord_loss = total_coord_loss / (len(val_dataloader) * batch_size)
-        avg_energy_loss = total_energy_loss / (len(val_dataloader) * batch_size)
+        avg_val_loss = total_val_loss / v_batches
+        avg_coord_loss = total_coord_loss / (v_batches * batch_size)
+        avg_energy_loss = total_energy_loss / (v_batches * batch_size)
         print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.6f} (Coord: {avg_coord_loss:.6f}, Energy: {avg_energy_loss:.6f})")
         
         epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss, avg_coord_loss, avg_energy_loss))
@@ -359,7 +361,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             plt.close()
 
         # Generate 3D point cloud visualization with embedding-based coloring
-        visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=1)
+        visualize_embeddings_3d(model, train_dataset, epoch, output_dir, n_events=1)
 
     # Save model
     save_path = os.path.join(output_dir, f"checkpoint_h{num_hits}_e{embed_dim}_neigh{use_neighborhood}.pth")
