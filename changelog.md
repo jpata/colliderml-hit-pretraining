@@ -1,5 +1,11 @@
 # Changelog
 
+## [Iteration 12]
+- Increased `num_hits` from 512 to 1024 (Curriculum Learning).
+- Observed a slight increase in `coord_loss` (~0.0008) and `val_loss` (~0.0023) compared to 512 hits, likely due to the increased task complexity from a larger local context.
+- `energy_loss` remained very low (~0.000004).
+- Density-MAE correlation remained high at ~ -0.80.
+
 ## [Iteration 11]
 - Implemented log-scaling for energy: `log10(energy + 1)`.
 - Increased `num_hits` from 256 to 512 (Curriculum Learning).
