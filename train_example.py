@@ -148,8 +148,10 @@ class PointNetEncoder(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
             nn.ReLU()
         )
         
@@ -157,7 +159,7 @@ class PointNetEncoder(nn.Module):
         return self.mlp(x)
 
 class MaskedPointModel(nn.Module):
-    def __init__(self, embed_dim=128, nhead=8, num_layers=4):
+    def __init__(self, embed_dim=128, nhead=8, num_layers=8):
         super().__init__()
         self.hit_encoder = PointNetEncoder(input_dim=4, embed_dim=embed_dim)
         
@@ -175,6 +177,7 @@ class MaskedPointModel(nn.Module):
         # Reconstruction head (predicts x, y, z, e)
         self.reconstructor = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, 4)
         )

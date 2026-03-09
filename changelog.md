@@ -1,5 +1,9 @@
 # Changelog
 
+## [Iteration 3]
+- Added `LayerNorm` to `PointNetEncoder` and `reconstructor` for better stability.
+- Increased `num_layers` of the Transformer from 4 to 8.
+
 ## [Iteration 2]
 - Increased default `batch_size` from 4 to 16 for more stable gradients.
 - Added `CosineAnnealingLR` scheduler to help convergence.
