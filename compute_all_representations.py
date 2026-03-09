@@ -15,39 +15,45 @@ import argparse
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--num_hits", type=int, default=256)
-    parser.add_argument("--embed_dim", type=int, default=16)
+    parser.add_argument("--num_hits", type=int, default=256, help="Window size for sliding window inference")
+    parser.add_argument("--embed_dim", type=int, default=128, help="Embedding dimension used during training")
     parser.add_argument("--max_events", type=int, default=5)
     parser.add_argument("--output_file", type=str, default="full_event_embeddings.pt")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
     # Load model
     model = MaskedPointModel(embed_dim=args.embed_dim).to(device)
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
     model.eval()
     
-    # Load dataset (raw, no fixed sampling)
-    # We'll use a modified approach to get the full events
-    dataset = CalorimeterDataset(num_hits=1, max_events=args.max_events)
+    # Load dataset (using base class to access get_full_event)
+    dataset = CalorimeterDataset(num_hits=args.num_hits, max_events=args.max_events)
+    num_events = len(dataset)
     
     all_event_results = []
     
-    print(f"Computing representations for {len(dataset.events)} full events...")
-    for idx in tqdm(range(len(dataset.events))):
-        # Extract all hits from the partition
-        event = dataset.events[idx]
-        x = np.concatenate(event["x"].to_numpy()) / dataset.coord_scale
-        y = np.concatenate(event["y"].to_numpy()) / dataset.coord_scale
-        z = np.concatenate(event["z"].to_numpy()) / dataset.coord_scale
-        e = np.concatenate(event["total_energy"].to_numpy()) / dataset.energy_scale
-        hits = torch.from_numpy(np.stack([x, y, z, e], axis=1).astype(np.float32)).to(device)
+    print(f"Computing representations for {num_events} full events...")
+    for idx in tqdm(range(num_events)):
+        # Extract all hits for the full event
+        event_data = dataset.get_full_event(idx)
         
-        embeddings = compute_all_hit_representations(model, hits, window_size=args.num_hits)
+        # Currently only calo hits are processed as tracker hits are empty in dataset.py
+        calo_hits = torch.from_numpy(event_data["calo_hits"]).to(device)
+        tracker_hits = torch.from_numpy(event_data["tracker_hits"]).to(device)
+        
+        all_hits = torch.cat([calo_hits, tracker_hits], dim=0)
+        if all_hits.shape[0] == 0:
+            continue
+            
+        # Compute embeddings for all hits in the event using the sliding window
+        embeddings = compute_all_hit_representations(model, all_hits, window_size=args.num_hits)
+        
         all_event_results.append({
-            "event_id": event["event_id"][0],
-            "hits": hits.cpu().numpy(),
+            "event_id": event_data["event_id"],
+            "hits": all_hits.cpu().numpy(),
             "embeddings": embeddings.cpu().numpy()
         })
         

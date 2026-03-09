@@ -355,10 +355,11 @@ class MaskedPointModel(nn.Module):
         
         return reconstructed, mask_indices, latent
 
-def compute_density(hits, radius=0.02):
+def compute_density(hits, radii=[0.01, 0.02, 0.05]):
     """
-    Computes local density for hits.
+    Computes multi-scale local density for hits by averaging neighbor counts at different radii.
     hits: (N, 4) or (B, N, 4)
+    radii: list of radii to compute density at
     """
     if len(hits.shape) == 2:
         hits = hits.unsqueeze(0)
@@ -368,8 +369,12 @@ def compute_density(hits, radius=0.02):
     
     # Pairwise distances
     dist_sq = torch.cdist(coords, coords)**2
-    density = (dist_sq < radius**2).float().sum(dim=2) # (B, N)
-    return density
+    
+    combined_density = torch.zeros((B, N), device=hits.device)
+    for r in radii:
+        combined_density += (dist_sq < r**2).float().sum(dim=2)
+        
+    return combined_density / len(radii)
 
 def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4, 
           output_dir="results", output_loss=None, use_neighborhood=True, 
@@ -411,13 +416,16 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=mask_ratio)
             
             # Extract masked targets and preds
-            all_masked_targets = []
-            all_masked_preds = []
-            for b in range(batch_hits.shape[0]):
-                all_masked_targets.append(batch_hits[b, mask_indices[b]])
-                all_masked_preds.append(reconstructed[b, mask_indices[b]])
+            masked_targets = torch.cat([batch_hits[b, mask_indices[b]] for b in range(batch_hits.shape[0])])
+            masked_preds = torch.cat([reconstructed[b, mask_indices[b]] for b in range(batch_hits.shape[0])])
             
-            loss = nn.SmoothL1Loss()(torch.cat(all_masked_preds), torch.cat(all_masked_targets))
+            # Energy-weighted loss: weight each hit's loss by its energy (4th column, index 3)
+            # The energy is already log-scaled in the dataset.
+            weights = masked_targets[:, 3]
+            
+            # Compute per-hit loss (mean over x, y, z, e components) and apply weights
+            loss_raw = nn.SmoothL1Loss(reduction='none')(masked_preds, masked_targets).mean(dim=1)
+            loss = (loss_raw * weights).mean()
             
             optimizer.zero_grad()
             loss.backward()
@@ -524,7 +532,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             plt.figure(figsize=(10, 6))
             plt.hexbin(density_stats[:, 0], density_stats[:, 1], gridsize=100, cmap='YlOrRd', bins='log', xscale='log', yscale='log')
             plt.colorbar(label='Log10(Count)')
-            plt.xlabel('Local Hit Density (Neighbors in radius 0.05)')
+            plt.xlabel('Multi-Scale Local Hit Density (Avg neighbors at r=0.01, 0.02, 0.05)')
             plt.ylabel('Reconstruction MAE')
             plt.title(f'Fidelity vs Density - Epoch {epoch+1}')
             plt.savefig(os.path.join(output_dir, f"fidelity_vs_density_epoch_{epoch+1}.png"))

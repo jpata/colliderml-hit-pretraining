@@ -17,7 +17,7 @@ We evaluate the model's ability to use context through **Density-Conditioned Rec
 
 ## Project Structure
 
-*   `dataset.py`: Contains `NeighborhoodCalorimeterDataset` for spatially-aware sampling.
+*   `dataset.py`: Contains `NeighborhoodCalorimeterDataset` for spatially-aware sampling. Note: expects data to be located in `~/.cache/colliderml`.
 *   `train_example.py`: The main training script. Features:
     *   Efficient Transformer backbone (using FlashAttention via `scaled_dot_product_attention`).
     *   Automated generation of **Fidelity vs. Density** plots.
@@ -46,9 +46,9 @@ Train a model using the neighborhood sampling strategy:
 ```bash
 pixi run python train_example.py \
     --num_hits 256 \
-    --embed_dim 32 \
+    --embed_dim 128 \
     --epochs 10 \
-    --use_neighborhood \
+    --neighborhood True \
     --output_dir results/my_experiment
 ```
 
@@ -58,10 +58,11 @@ Once trained, compute embeddings for all hits in the dataset:
 
 ```bash
 pixi run python compute_all_representations.py \
-    --checkpoint results/my_experiment/checkpoint_h256_e32_neighTrue.pth \
+    --checkpoint results/my_experiment/checkpoint_h256_e128_neighTrue.pth \
     --num_hits 256 \
+    --embed_dim 128 \
     --max_events 5 \
-    --output_file full_embeddings.pt
+    --output_file full_event_embeddings.pt
 ```
 
 ### 3. Hyperparameter Scanning
@@ -74,6 +75,9 @@ pixi run snakemake --cores 4
 
 ## Results & Plots
 
-*   **`umap_epoch_N.png`**: UMAP visualization of the latent space.
-*   **`fidelity_vs_density_epoch_N.png`**: Heatmap showing how reconstruction accuracy improves with local hit density.
+*   **`umap_epoch_{N}_ev{idx}.png`**: UMAP visualization of the latent space for a specific event.
+*   **`point_cloud_epoch_{N}_ev{idx}.png`**: 3D point cloud visualization of hits colored by clustering.
+*   **`feature_correlation_epoch_{N}.png`**: Heatmap showing correlation between embedding dimensions and input features.
+*   **`representation_metrics_evolution.png`**: Evolution of representation metrics over epochs.
+*   **`fidelity_vs_density_epoch_{N}.png`**: Heatmap showing how reconstruction accuracy improves with local hit density.
 *   **`full_event_embeddings.pt`**: Serialized tensor containing (Hit Coords, Latent Embedding) for downstream tasks.
