@@ -10,46 +10,43 @@ Achieve convergence of the validation loss for the Masked Point Modeling task.
 *   **Task:** Masked Point Modeling (reconstruct x, y, z, e of 75% masked hits).
 *   **Loss:** SmoothL1Loss on masked hits.
 *   **Optimization:** Adam with Cosine Annealing, LR=3e-4.
-*   **Data:** `NeighborhoodCalorimeterDataset` (**neighborhood=True**) with **256 hits** and 2000 events. This ensures that the model primarily uses local information (spatial correlations within a shower) to reconstruct masked hits.
-*   **Additional Metrics:** Monitor reconstruction fidelity vs density and 3D embedding clusters.
+*   **Data:** `NeighborhoodCalorimeterDataset` (**neighborhood=True**) with **256 hits** (initial) and 2000 events. This ensures that the model primarily uses local information (spatial correlations within a shower) to reconstruct masked hits.
+*   **Additional Metrics:** Monitor reconstruction fidelity vs density, 3D embedding clusters, and separate coordinate vs energy loss.
 
-## Iterative Process (Up to 10 iterations)
+## Energy Reconstruction Improvement Strategies
+Recent iterations identified energy reconstruction as a primary bottleneck. Consider the following:
+*   **Log-scale Energy:** Train on `log10(energy + epsilon)` to better handle the high dynamic range of calorimeter hits.
+*   **Weighted Loss:** Apply a weight to the energy loss component proportional to the hit energy (or log-energy) to force the model to prioritize high-energy shower cores.
+*   **Auxiliary Loss:** Implement a total energy conservation loss (sum of reconstructed vs sum of true energy in the window).
+
+## Iterative Process (Up to 20 iterations)
 
 1.  **Run Training:**
     Execute the training task using pixi:
     ```bash
     pixi run train
     ```
-    This will run `train_example.py` with default parameters and save results to the `results/` directory.
+    This will run `train_example.py` with parameters defined in `pixi.toml`.
 
 2.  **Evaluate Convergence and Performance:**
-    *   Inspect `results/loss.csv` to see the `train_loss` and `val_loss` over epochs.
-    *   Check if `val_loss` is decreasing and stabilizing.
+    *   Inspect `results/loss.csv` to see `train_loss`, `val_loss`, `coord_loss`, and `energy_loss`.
     *   Assess the density-fidelity correlation and 3D visualizations.
-    *   **Identify gaps:** Are there specific behaviors (e.g., poor reconstruction of high-energy hits, lack of spatial coherence) not captured by current metrics?
+    *   **Identify gaps:** Is the model struggling with specific energy scales or spatial regions?
 
 3.  **Refine Strategy and Metrics:**
+    *   **Curriculum Learning (Hits Scheduling):** Gradually increase `num_hits` (e.g., from 256 to 512, then 1024) across iterations to increase the complexity of the local context.
     *   Update the **Current Strategy** section if a shift in approach is needed.
-    *   **Introduce new metrics:** If findings suggest a new way to measure success (e.g., energy conservation, cluster separation metrics), add them to the code and the strategy.
     *   Modify `train_example.py`, `dataset.py`, or `pixi.toml` accordingly.
-    *   Possible changes include:
-        *   Adjusting learning rate or scheduler.
-        *   Modifying model architecture (e.g., `embed_dim`, number of layers/heads).
-        *   Changing training hyperparameters (e.g., `batch_size`, `epochs`, `mask_ratio`).
-        *   Adjusting data normalization or sampling strategy (different local sampling schemes are allowed, but **global sampling is forbidden** as the model must focus on local correlations).
 
 4.  **Log and Commit:**
-    *   Update `changelog.md` with:
-        *   A summary of the outcome of the previous iteration.
-        *   The changes made in the current iteration and the justification.
-        *   Any updates to the overall strategy.
-    *   Commit the changes to the codebase with a meaningful message. **Ensure that the `results/` and `results_iteration_N/` folders are not staged or committed (they should be ignored by `.gitignore`).**
+    *   Update `changelog.md` with a summary of the iteration outcome and changes made.
+    *   Commit the changes to the codebase. **Ensure that `results/` folders are ignored.**
 
 5.  **Archive Results:**
-    *   Move the contents of the `results/` directory to a new folder named `results_iteration_N/` (where N is the iteration number).
+    *   Move `results/` to `results_iteration_N/`.
 
 6.  **Repeat:**
-    *   Repeat steps 1-5 for up to 10 iterations or until satisfactory convergence is achieved.
+    *   Repeat steps 1-5 for up to 20 iterations or until satisfactory convergence is achieved.
 
 ## Verification
 *   Monitor the `loss.csv` and generated plots in each iteration's results folder.
