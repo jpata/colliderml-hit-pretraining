@@ -1,10 +1,15 @@
 # Changelog
 
+## [Iteration 8]
+- Switched to `neighborhood=False` (random global sampling) to increase task difficulty and learn global dependencies.
+- Increased `num_hits` from 256 to 512 to provide more context for global sampling.
+- Kept `mask_ratio=0.75` and `lr=3e-4`.
+
 ## [Iteration 7]
-- Increased `mask_ratio` from 0.5 to 0.75 to make the reconstruction task more challenging.
-- Increased `max_events` from 1000 to 2000 for more data diversity.
-- Increased learning rate from 1e-4 to 3e-4 for faster exploration.
-- Modified `train_example.py` to support `mask_ratio` and `lr` as CLI arguments.
+- Increased `mask_ratio` from 0.5 to 0.75.
+- Increased `max_events` to 2000.
+- Observed that convergence remained very fast with low loss (~0.0006), reinforcing that the local neighborhood task is likely too simple.
+- Strong negative correlation (~ -0.7) between density and MAE persisted.
 
 ## [Iteration 6]
 - Ran training with 1000 events (limited to avoid OOM).
