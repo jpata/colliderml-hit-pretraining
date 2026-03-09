@@ -2,7 +2,7 @@
 """
 Dataset definitions for Calorimeter Hits.
 Uses IterableDataset for efficient chunked loading and worker partitioning.
-Memory optimized to avoid OOM by using smaller chunks.
+Memory optimized to avoid OOM by using manual slicing instead of explode().
 """
 
 import torch
@@ -14,7 +14,7 @@ import polars as pl
 from pathlib import Path
 
 class CalorimeterDataset(IterableDataset):
-    def __init__(self, num_hits=2048, max_events=None, verbose=False, chunk_size=10):
+    def __init__(self, num_hits=2048, max_events=None, verbose=False, chunk_size=20):
         self.verbose = verbose
         self.num_hits = num_hits
         self.max_events = max_events
@@ -36,30 +36,23 @@ class CalorimeterDataset(IterableDataset):
         self.required_cols = ["x", "y", "z", "total_energy"]
 
     def _process_chunk(self, df):
-        """Processes a chunk of events into a list of hit arrays."""
-        # Check if empty
-        if df.height == 0:
-            return []
-            
-        # 1. Get offsets for each event
-        lengths = df["x"].list.len().to_numpy()
-        offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
-        offsets[1:] = np.cumsum(lengths)
-        
-        # 2. Explode to get flat representation
-        flat_df = df.explode(self.required_cols)
-        
-        # 3. Extract columns as numpy arrays directly
-        x = flat_df["x"].to_numpy().astype(np.float32) / self.coord_scale
-        y = flat_df["y"].to_numpy().astype(np.float32) / self.coord_scale
-        z = flat_df["z"].to_numpy().astype(np.float32) / self.coord_scale
-        e = np.log10(flat_df["total_energy"].to_numpy().astype(np.float32) + 1.0)
-        
-        flat_hits = np.stack([x, y, z, e], axis=1)
-        
+        """Processes a chunk of events into a list of hit arrays using manual conversion."""
         events = []
-        for i in range(len(lengths)):
-            events.append(flat_hits[offsets[i]:offsets[i+1]])
+        # Convert columns to numpy once per chunk
+        # Note: Polars Series of Lists to numpy returns a nested numpy array (object type)
+        # We manually convert each list to a flat float32 array
+        x_lists = df["x"].to_list()
+        y_lists = df["y"].to_list()
+        z_lists = df["z"].to_list()
+        e_lists = df["total_energy"].to_list()
+        
+        for i in range(len(x_lists)):
+            x = np.array(x_lists[i], dtype=np.float32) / self.coord_scale
+            y = np.array(y_lists[i], dtype=np.float32) / self.coord_scale
+            z = np.array(z_lists[i], dtype=np.float32) / self.coord_scale
+            e = np.log10(np.array(e_lists[i], dtype=np.float32) + 1.0)
+            events.append(np.stack([x, y, z, e], axis=1))
+            
         return events
 
     def __iter__(self):
@@ -76,28 +69,21 @@ class CalorimeterDataset(IterableDataset):
             if self.verbose:
                 print(f"Worker {os.getpid()} processing shard {shard_path.name}")
             
-            # Read metadata to get row count if not 1000
-            # For now assume 1000 as per previous checks
+            # Use scan_parquet for efficient slicing
+            lf = pl.scan_parquet(shard_path, low_memory=True)
             
             for start in range(0, self.rows_per_shard, self.chunk_size):
                 if self.max_events and events_yielded >= self.max_events:
                     return
                 
-                # Load a chunk of events eagerly to avoid overhead of many small scans
                 num_to_load = min(self.chunk_size, self.rows_per_shard - start)
                 
-                # Using read_parquet with row_count and n_rows for efficiency if possible
-                # But slice is fine for local parquet.
                 try:
-                    chunk_df = pl.read_parquet(
-                        shard_path, 
-                        columns=self.required_cols,
-                        # No direct slice in read_parquet, but we can use use_pyarrow or just scan
-                    )
-                    chunk_df = chunk_df.slice(start, num_to_load)
+                    # Efficiently load ONLY the chunk
+                    chunk_df = lf.slice(start, num_to_load).collect()
                 except Exception as e:
                     if self.verbose:
-                        print(f"Error reading shard {shard_path}: {e}")
+                        print(f"Error reading chunk from {shard_path}: {e}")
                     break
                 
                 # Process chunk into list of arrays
