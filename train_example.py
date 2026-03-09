@@ -104,10 +104,11 @@ def visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=2):
         
         def get_colors(lbls):
             # Map -1 to black, others to discrete colors
+            # Must return consistent format (all RGBA tuples) to avoid matplotlib errors
             cols = []
             for l in lbls:
                 if l == -1:
-                    cols.append('black')
+                    cols.append((0, 0, 0, 1)) # Black as RGBA
                 else:
                     cols.append(cmap(l % 20))
             return cols
@@ -227,7 +228,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     
     os.makedirs(output_dir, exist_ok=True)
 
-    lr = 1e-3
+    lr = 1e-4
     
     # Dataset Selection
     if use_neighborhood:
@@ -248,6 +249,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     criterion = nn.MSELoss(reduction='none') # Need per-hit loss for density analysis
 
     # Training Loop
+    epoch_losses = []
     for epoch in range(epochs):
         model.train()
         total_train_loss = 0
@@ -303,6 +305,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         
         avg_val_loss = total_val_loss / len(val_dataloader)
         print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.6f}")
+        
+        epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss))
 
         # Plot Reconstruction Fidelity vs Density
         if density_stats:
@@ -327,8 +331,10 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     if output_loss:
         loss_file_path = os.path.join(output_dir, output_loss)
         with open(loss_file_path, "w") as f:
-            f.write(f"{avg_val_loss:.6f}\n")
-        print(f"Loss saved to {loss_file_path}")
+            f.write("epoch,train_loss,val_loss\n")
+            for e, t, v in epoch_losses:
+                f.write(f"{e},{t:.6f},{v:.6f}\n")
+        print(f"Losses saved to {loss_file_path}")
 
 if __name__ == "__main__":
     import argparse

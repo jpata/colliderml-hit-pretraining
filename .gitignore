@@ -2,3 +2,6 @@
 .pixi/*
 !.pixi/config.toml
 *.pth
+pixi.lock
+.snakemake/**
+__pycache__/**
