@@ -341,7 +341,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 print(f"Epoch {epoch+1} Log-Log Correlation (Density vs MAE): {corr:.4f}")
 
             plt.figure(figsize=(10, 6))
-            plt.hexbin(density_stats[:, 0], density_stats[:, 1], gridsize=30, cmap='YlOrRd', bins='log', xscale='log', yscale='log')
+            plt.hexbin(density_stats[:, 0], density_stats[:, 1], gridsize=50, cmap='YlOrRd', bins='log', xscale='log', yscale='log')
             plt.colorbar(label='Log10(Count)')
             plt.xlabel('Local Hit Density (Neighbors in radius 0.05)')
             plt.ylabel('Reconstruction MAE')

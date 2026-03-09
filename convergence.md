@@ -10,7 +10,7 @@ Achieve convergence of the validation loss for the Masked Point Modeling task.
 *   **Task:** Masked Point Modeling (reconstruct x, y, z, e of 75% masked hits).
 *   **Loss:** SmoothL1Loss on masked hits.
 *   **Optimization:** Adam with Cosine Annealing, LR=3e-4.
-*   **Data:** `CalorimeterDataset` (**neighborhood=False**) with **512 hits** and 2000 events.
+*   **Data:** `NeighborhoodCalorimeterDataset` (**neighborhood=True**) with **256 hits** and 2000 events. This ensures that the model primarily uses local information (spatial correlations within a shower) to reconstruct masked hits.
 *   **Additional Metrics:** Monitor reconstruction fidelity vs density and 3D embedding clusters.
 
 ## Iterative Process (Up to 10 iterations)
@@ -36,14 +36,14 @@ Achieve convergence of the validation loss for the Masked Point Modeling task.
         *   Adjusting learning rate or scheduler.
         *   Modifying model architecture (e.g., `embed_dim`, number of layers/heads).
         *   Changing training hyperparameters (e.g., `batch_size`, `epochs`, `mask_ratio`).
-        *   Adjusting data normalization or sampling strategy.
+        *   Adjusting data normalization or sampling strategy (different local sampling schemes are allowed, but **global sampling is forbidden** as the model must focus on local correlations).
 
 4.  **Log and Commit:**
     *   Update `changelog.md` with:
         *   A summary of the outcome of the previous iteration.
         *   The changes made in the current iteration and the justification.
         *   Any updates to the overall strategy.
-    *   Commit the changes to the codebase with a meaningful message.
+    *   Commit the changes to the codebase with a meaningful message. **Ensure that the `results/` and `results_iteration_N/` folders are not staged or committed (they should be ignored by `.gitignore`).**
 
 5.  **Archive Results:**
     *   Move the contents of the `results/` directory to a new folder named `results_iteration_N/` (where N is the iteration number).

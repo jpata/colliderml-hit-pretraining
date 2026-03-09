@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-from colliderml.core import load_tables, collect_tables
+from colliderml.core import load_tables
 
 class CalorimeterDataset(Dataset):
     def __init__(self, num_hits=2048, max_events=None):
@@ -17,14 +17,15 @@ class CalorimeterDataset(Dataset):
             "pileup": "pu0",
             "objects": ["particles", "tracker_hits", "calo_hits", "tracks"],
             "split": "train",
-            "lazy": False,
+            "lazy": True,
             "max_events": max_events,
         }
-        print(f"Loading data from ColliderML (max_events={max_events})...")
-        tables = load_tables(cfg)
-        self.frames = collect_tables(tables)
-        # Group hits by event_id to get a list of events (DataFrames)
-        self.events = self.frames["calo_hits"].partition_by("event_id", include_key=True)
+        print(f"Loading data from ColliderML (max_events={max_events}, lazy=True)...")
+        self.frames = load_tables(cfg)
+        
+        # Each row in calo_hits is one event, so the number of rows is the number of events.
+        import polars as pl
+        self.num_events = self.frames["calo_hits"].select(pl.len()).collect().item()
         self.num_hits = num_hits
         
         # Pre-calculated normalization constants (approximate)
@@ -32,10 +33,11 @@ class CalorimeterDataset(Dataset):
         self.energy_scale = 0.1
 
     def __len__(self):
-        return len(self.events)
+        return self.num_events
 
     def __getitem__(self, idx):
-        event = self.events[idx]
+        # Fetch only the requested event (row) from the lazy frame
+        event = self.frames["calo_hits"].slice(idx, 1).collect()
         
         # Extract features (x, y, z, total_energy) and flatten if they are list columns
         x = np.concatenate(event["x"].to_numpy()) / self.coord_scale
@@ -61,13 +63,14 @@ class CalorimeterDataset(Dataset):
 
     def get_full_event(self, idx):
         """Returns all calo and tracker hits for a given event index."""
-        calo_event = self.events[idx]
+        calo_event = self.frames["calo_hits"].slice(idx, 1).collect()
         event_id = calo_event["event_id"][0]
         
         # Get tracker hits for the same event
         import polars as pl
         tracker_frames = self.frames["tracker_hits"]
-        tracker_event = tracker_frames.filter(pl.col("event_id") == event_id)
+        # Filter tracker hits by event_id and collect
+        tracker_event = tracker_frames.filter(pl.col("event_id") == event_id).collect()
         
         def process_hits(df, is_tracker=False):
             if len(df) == 0:
@@ -101,7 +104,8 @@ class NeighborhoodCalorimeterDataset(CalorimeterDataset):
         print(f"Loading data for NeighborhoodDataset (max_events={max_events})...")
 
     def __getitem__(self, idx):
-        event = self.events[idx]
+        # Fetch only the requested event (row) from the lazy frame
+        event = self.frames["calo_hits"].slice(idx, 1).collect()
         
         x = np.concatenate(event["x"].to_numpy()) / self.coord_scale
         y = np.concatenate(event["y"].to_numpy()) / self.coord_scale
@@ -135,26 +139,22 @@ def validate_dataset(max_events=100, output_dir="validation_plots"):
     num_events = len(dataset)
     
     # Collect calo hits info
+    import polars as pl
     calo_frames = dataset.frames["calo_hits"]
+    if isinstance(calo_frames, pl.LazyFrame):
+        calo_frames = calo_frames.collect()
+        
     tracker_frames = dataset.frames["tracker_hits"]
+    if isinstance(tracker_frames, pl.LazyFrame):
+        tracker_frames = tracker_frames.collect()
     
     # Multiplicities per event
-    import polars as pl
     if isinstance(calo_frames, pl.DataFrame):
         # Multiplicity is the length of the list columns since each row is one event
         calo_multiplicities = calo_frames["total_energy"].list.len().to_numpy()
         tracker_multiplicities = tracker_frames["x"].list.len().to_numpy()
     else:
-        # Fallback if they are not polars (e.g. if they are already partitioned)
-        calo_multiplicities = []
-        for i in range(num_events):
-            calo_multiplicities.append(len(dataset.events[i]))
-        
-        if hasattr(tracker_frames, "partition_by"):
-            tracker_events = tracker_frames.partition_by("event_id", include_key=True)
-            tracker_multiplicities = [len(ev) for ev in tracker_events]
-        else:
-            tracker_multiplicities = [0] * num_events
+        raise ValueError("calo_frames must be a Polars DataFrame for validation.")
 
     # Collect energy values
     def flatten_column(df, col_name):

@@ -5,3 +5,5 @@
 pixi.lock
 .snakemake/**
 __pycache__/**
+results/
+results_iteration_*/
