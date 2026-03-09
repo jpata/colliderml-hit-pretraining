@@ -240,9 +240,9 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
 
     # Dataset Selection
     if use_neighborhood:
-        full_dataset = NeighborhoodCalorimeterDataset(num_hits=num_hits, max_events=max_events)
+        full_dataset = NeighborhoodCalorimeterDataset(num_hits=num_hits, max_events=max_events, verbose=False)
     else:
-        full_dataset = CalorimeterDataset(num_hits=num_hits, max_events=max_events)
+        full_dataset = CalorimeterDataset(num_hits=num_hits, max_events=max_events, verbose=False)
     
     # Split into train and validation
     train_size = int(0.8 * len(full_dataset))

@@ -7,10 +7,14 @@ from torch.utils.data import Dataset
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import time
+import polars as pl
 from colliderml.core import load_tables
 
 class CalorimeterDataset(Dataset):
-    def __init__(self, num_hits=2048, max_events=None):
+    def __init__(self, num_hits=2048, max_events=None, verbose=False):
+        self.verbose = verbose
+        start_time = time.time()
         cfg = {
             "dataset_id": "CERN/ColliderML-Release-1",
             "channels": "ttbar",
@@ -20,12 +24,29 @@ class CalorimeterDataset(Dataset):
             "lazy": True,
             "max_events": max_events,
         }
-        print(f"Loading data from ColliderML (max_events={max_events}, lazy=True)...")
+        if self.verbose:
+            print(f"Loading data from ColliderML (max_events={max_events}, lazy=True)...")
+        
         self.frames = load_tables(cfg)
         
+        if self.verbose:
+            print(f"Tables metadata loaded in {time.time() - start_time:.2f}s")
+            count_start = time.time()
+
+        # Collect data into memory to avoid repeated slow lazy fetches in __getitem__
+        for key in ["calo_hits", "tracker_hits"]:
+            if key in self.frames and isinstance(self.frames[key], pl.LazyFrame):
+                if self.verbose:
+                    print(f"Collecting {key} into memory...")
+                self.frames[key] = self.frames[key].collect()
+
         # Each row in calo_hits is one event, so the number of rows is the number of events.
-        import polars as pl
-        self.num_events = self.frames["calo_hits"].select(pl.len()).collect().item()
+        self.num_events = self.frames["calo_hits"].height
+        
+        if self.verbose:
+            print(f"Data collected in {time.time() - count_start:.2f}s")
+            print(f"Total initialization time: {time.time() - start_time:.2f}s")
+
         self.num_hits = num_hits
         
         # Pre-calculated normalization constants (approximate)
@@ -36,9 +57,14 @@ class CalorimeterDataset(Dataset):
         return self.num_events
 
     def __getitem__(self, idx):
-        # Fetch only the requested event (row) from the lazy frame
-        event = self.frames["calo_hits"].slice(idx, 1).collect()
+        start_time = time.time() if self.verbose else None
+        # Fetch only the requested event (row) from the memory frame
+        event = self.frames["calo_hits"].slice(idx, 1)
         
+        if self.verbose:
+            fetch_time = time.time() - start_time
+            process_start = time.time()
+
         # Extract features (x, y, z, total_energy) and flatten if they are list columns
         x = np.concatenate(event["x"].to_numpy()) / self.coord_scale
         y = np.concatenate(event["y"].to_numpy()) / self.coord_scale
@@ -59,18 +85,20 @@ class CalorimeterDataset(Dataset):
             padding = np.zeros((self.num_hits - n_hits, 4), dtype=np.float32)
             hits = np.concatenate([hits, padding], axis=0)
             
+        if self.verbose:
+            print(f"__getitem__({idx}): fetch={fetch_time:.4f}s, process={time.time() - process_start:.4f}s")
+
         return torch.from_numpy(hits)
 
     def get_full_event(self, idx):
         """Returns all calo and tracker hits for a given event index."""
-        calo_event = self.frames["calo_hits"].slice(idx, 1).collect()
+        calo_event = self.frames["calo_hits"].slice(idx, 1)
         event_id = calo_event["event_id"][0]
         
         # Get tracker hits for the same event
-        import polars as pl
         tracker_frames = self.frames["tracker_hits"]
-        # Filter tracker hits by event_id and collect
-        tracker_event = tracker_frames.filter(pl.col("event_id") == event_id).collect()
+        # Filter tracker hits by event_id
+        tracker_event = tracker_frames.filter(pl.col("event_id") == event_id)
         
         def process_hits(df, is_tracker=False):
             if len(df) == 0:
@@ -94,19 +122,27 @@ class CalorimeterDataset(Dataset):
             "tracker_hits": tracker_hits
         }
 
+
+
 class NeighborhoodCalorimeterDataset(CalorimeterDataset):
     """
     Dataset that samples a 'neighborhood' around a randomly selected seed hit.
     This is better for learning local correlations in large events.
     """
-    def __init__(self, num_hits=256, max_events=None):
-        super().__init__(num_hits=num_hits, max_events=max_events)
-        print(f"Loading data for NeighborhoodDataset (max_events={max_events})...")
+    def __init__(self, num_hits=256, max_events=None, verbose=False):
+        super().__init__(num_hits=num_hits, max_events=max_events, verbose=verbose)
+        if self.verbose:
+            print(f"Loading data for NeighborhoodDataset (max_events={max_events})...")
 
     def __getitem__(self, idx):
-        # Fetch only the requested event (row) from the lazy frame
-        event = self.frames["calo_hits"].slice(idx, 1).collect()
+        start_time = time.time() if self.verbose else None
+        # Fetch only the requested event (row) from the memory frame
+        event = self.frames["calo_hits"].slice(idx, 1)
         
+        if self.verbose:
+            fetch_time = time.time() - start_time
+            process_start = time.time()
+
         x = np.concatenate(event["x"].to_numpy()) / self.coord_scale
         y = np.concatenate(event["y"].to_numpy()) / self.coord_scale
         z = np.concatenate(event["z"].to_numpy()) / self.coord_scale
@@ -118,28 +154,32 @@ class NeighborhoodCalorimeterDataset(CalorimeterDataset):
         if n_hits <= self.num_hits:
             # If event is small, pad as usual
             padding = np.zeros((self.num_hits - n_hits, 4), dtype=np.float32)
-            return torch.from_numpy(np.concatenate([hits, padding], axis=0))
+            result = torch.from_numpy(np.concatenate([hits, padding], axis=0))
+        else:
+            # 1. Select a random 'seed' hit (weighted by energy to focus on showers)
+            probs = e / (e.sum() + 1e-9)
+            seed_idx = np.random.choice(n_hits, p=probs)
+            seed_pos = hits[seed_idx, :3]
+            
+            # 2. Find nearest neighbors
+            dists = np.sum((hits[:, :3] - seed_pos)**2, axis=1)
+            neighbor_indices = np.argsort(dists)[:self.num_hits]
+            result = torch.from_numpy(hits[neighbor_indices])
+            
+        if self.verbose:
+            print(f"Neighborhood __getitem__({idx}): fetch={fetch_time:.4f}s, process={time.time() - process_start:.4f}s")
 
-        # 1. Select a random 'seed' hit (weighted by energy to focus on showers)
-        probs = e / (e.sum() + 1e-9)
-        seed_idx = np.random.choice(n_hits, p=probs)
-        seed_pos = hits[seed_idx, :3]
-        
-        # 2. Find nearest neighbors
-        dists = np.sum((hits[:, :3] - seed_pos)**2, axis=1)
-        neighbor_indices = np.argsort(dists)[:self.num_hits]
-        
-        return torch.from_numpy(hits[neighbor_indices])
+        return result
 
-def validate_dataset(max_events=100, output_dir="validation_plots"):
+def validate_dataset(max_events=100, output_dir="validation_plots", verbose=True):
     """
     Validates the dataset by plotting distributions and printing a summary.
     """
-    dataset = CalorimeterDataset(num_hits=2048, max_events=max_events)
+    dataset = CalorimeterDataset(num_hits=2048, max_events=max_events, verbose=verbose)
     num_events = len(dataset)
     
-    # Collect calo hits info
-    import polars as pl
+    print("\nCollecting data for validation plots...")
+    start_time = time.time()
     calo_frames = dataset.frames["calo_hits"]
     if isinstance(calo_frames, pl.LazyFrame):
         calo_frames = calo_frames.collect()
@@ -147,6 +187,8 @@ def validate_dataset(max_events=100, output_dir="validation_plots"):
     tracker_frames = dataset.frames["tracker_hits"]
     if isinstance(tracker_frames, pl.LazyFrame):
         tracker_frames = tracker_frames.collect()
+    
+    print(f"Data collection took {time.time() - start_time:.2f}s")
     
     # Multiplicities per event
     if isinstance(calo_frames, pl.DataFrame):
