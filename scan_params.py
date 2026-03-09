@@ -8,13 +8,19 @@ def run_train(num_hits, embed_dim, max_events):
     pixi_lib = os.path.join(os.getcwd(), ".pixi/envs/default/lib")
     env["LD_LIBRARY_PATH"] = f"{pixi_lib}:{env.get('LD_LIBRARY_PATH', '')}"
 
+    output_dir = f"results/h{num_hits}_e{embed_dim}_s{max_events}"
+    os.makedirs(output_dir, exist_ok=True)
+    loss_file = "loss.txt" # This will be saved inside output_dir by train_example.py
+
     cmd = [
         "python", "train_example.py",
         "--num_hits", str(num_hits),
         "--embed_dim", str(embed_dim),
         "--max_events", str(max_events),
         "--epochs", "1",
-        "--batch_size", "4"
+        "--batch_size", "4",
+        "--output_dir", output_dir,
+        "--output_loss", loss_file
     ]
     print(f"Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env)
@@ -32,7 +38,8 @@ def main():
     embed_dims = [16, 32]
     dataset_sizes = [100, 500]
 
-    results_file = "scan_results.txt"
+    os.makedirs("results", exist_ok=True)
+    results_file = "results/scan_results.txt"
     
     with open(results_file, "w") as f:
         f.write("num_hits,embed_dim,max_events,loss\n")

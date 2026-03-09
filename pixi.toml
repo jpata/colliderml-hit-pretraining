@@ -1,6 +1,6 @@
 [workspace]
 authors = ["Joosep Pata <joosep.pata@gmail.com>"]
-channels = ["pytorch", "conda-forge"]
+channels = ["pytorch", "conda-forge", "bioconda"]
 name = "pytorch-train"
 platforms = ["linux-64"]
 version = "0.1.0"
@@ -8,17 +8,23 @@ version = "0.1.0"
 [tasks]
 train = "LD_LIBRARY_PATH=$PIXI_PROJECT_ROOT/.pixi/envs/default/lib python train_example.py"
 scan = "LD_LIBRARY_PATH=$PIXI_PROJECT_ROOT/.pixi/envs/default/lib python scan_params.py"
+snakemake = "LD_LIBRARY_PATH=$PIXI_PROJECT_ROOT/.pixi/envs/default/lib snakemake"
 
 [dependencies]
 python = "*"
+libstdcxx-ng = "*"
+umap-learn = ">=0.5.11,<0.6"
+
+[pypi-dependencies]
+colliderml = "*"
 numpy = "*"
 awkward = "*"
 pyarrow = "*"
 pandas = "*"
 tqdm = "*"
-libstdcxx-ng = "*"
-
-[pypi-dependencies]
+matplotlib = "*"
+seaborn = "*"
+snakemake = "*"
 torch = "*"
 torchvision = "*"
 torchaudio = "*"

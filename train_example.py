@@ -1,55 +1,145 @@
 """
 Point Cloud Pretraining for Calorimeter Hits.
-Uses a Masked Point Modeling (MPM) approach with a Transformer encoder.
+Uses a Masked Point Modeling (MPM) approach with an efficient Transformer encoder.
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
+from dataset import CalorimeterDataset, NeighborhoodCalorimeterDataset
 import numpy as np
 import awkward as ak
 from tqdm import tqdm
+import umap
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from sklearn.cluster import DBSCAN
+import os
 
-class CalorimeterDataset(Dataset):
-    def __init__(self, file_path, num_hits=2048, max_events=None):
-        print(f"Loading data from {file_path}...")
-        self.events = ak.from_parquet(file_path)
-        if max_events is not None:
-            self.events = self.events[:max_events]
-        self.num_hits = num_hits
-        
-        # Pre-calculated normalization constants (approximate)
-        self.coord_scale = 5000.0
-        self.energy_scale = 0.1
-
-    def __len__(self):
-        return len(self.events)
-
-    def __getitem__(self, idx):
-        event = self.events[idx]
-        
-        # Extract features (x, y, z, energy)
-        x = np.array(event.x) / self.coord_scale
-        y = np.array(event.y) / self.coord_scale
-        z = np.array(event.z) / self.coord_scale
-        e = np.array(event.total_energy) / self.energy_scale
-        
-        # Combine into a single hit array (N, 4)
-        hits = np.stack([x, y, z, e], axis=1).astype(np.float32)
-        
-        # Fixed-size sampling/padding for batching
-        n_hits = hits.shape[0]
-        if n_hits >= self.num_hits:
-            # Randomly sample num_hits
-            indices = np.random.choice(n_hits, self.num_hits, replace=False)
-            hits = hits[indices]
-        else:
-            # Pad with zeros
-            padding = np.zeros((self.num_hits - n_hits, 4), dtype=np.float32)
-            hits = np.concatenate([hits, padding], axis=0)
+def compute_all_hit_representations(model, hits, window_size=256, overlap=128):
+    """
+    Computes embeddings for all hits in an event using overlapping windows.
+    hits: (N, 4) tensor
+    """
+    N = hits.shape[0]
+    embed_dim = model.mask_token.shape[0]
+    device = next(model.parameters()).device
+    
+    # Sort hits by Z coordinate to give some spatial order to the sliding window
+    z_indices = torch.argsort(hits[:, 2])
+    sorted_hits = hits[z_indices]
+    
+    # Storage for accumulated embeddings and counts
+    accumulated_embeddings = torch.zeros((N, embed_dim), device=device)
+    counts = torch.zeros((N, 1), device=device)
+    
+    step = max(1, window_size - overlap)
+    
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, N, step):
+            end = min(start + window_size, N)
+            window_hits = sorted_hits[start:end]
             
-        return torch.from_numpy(hits)
+            # Pad if window is smaller than window_size (for model compatibility if needed)
+            curr_size = window_hits.shape[0]
+            if curr_size < window_size:
+                padding = torch.zeros((window_size - curr_size, 4), device=device)
+                input_hits = torch.cat([window_hits, padding], dim=0).unsqueeze(0)
+            else:
+                input_hits = window_hits.unsqueeze(0)
+                
+            # Bypassing forward() masking logic
+            hit_embeddings = model.hit_encoder(input_hits)
+            latent = model.transformer(hit_embeddings)
+            
+            valid_latent = latent[0, :curr_size]
+            accumulated_embeddings[start:end] += valid_latent
+            counts[start:end] += 1
+            if end == N: break
+                
+    final_sorted_embeddings = accumulated_embeddings / counts
+    final_embeddings = torch.zeros_like(final_sorted_embeddings)
+    final_embeddings[z_indices] = final_sorted_embeddings
+    return final_embeddings
+
+def visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=2):
+    """
+    Visualize x, y, z point cloud of calo and tracker hits, 
+    colored by their clustering in the embedding space.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    print(f"Generating 3D point cloud visualizations for {n_events} events...")
+
+    for i in range(min(n_events, len(full_dataset))):
+        event_data = full_dataset.get_full_event(i)
+        calo_hits = torch.from_numpy(event_data["calo_hits"]).to(device)
+        tracker_hits = torch.from_numpy(event_data["tracker_hits"]).to(device)
+        
+        all_hits = torch.cat([calo_hits, tracker_hits], dim=0)
+        if all_hits.shape[0] == 0: continue
+        
+        # Compute embeddings for all hits in the event
+        embeddings = compute_all_hit_representations(model, all_hits, window_size=256)
+        embeddings_np = embeddings.cpu().numpy()
+        
+        # DBSCAN clustering: eps (radius) and min_samples
+        # These may need tuning based on the embedding space scale
+        clustering = DBSCAN(eps=0.5, min_samples=3).fit(embeddings_np)
+        clusters = clustering.labels_
+        
+        # Plotting
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Color normalization for clusters (using a discrete map)
+        # Handle noise (-1) by making it a separate color (e.g., black)
+        cmap = plt.get_cmap('tab20')
+        unique_labels = np.unique(clusters)
+        n_clusters_found = len(unique_labels) - (1 if -1 in unique_labels else 0)
+        
+        n_calo = calo_hits.shape[0]
+        
+        def get_colors(lbls):
+            # Map -1 to black, others to discrete colors
+            cols = []
+            for l in lbls:
+                if l == -1:
+                    cols.append('black')
+                else:
+                    cols.append(cmap(l % 20))
+            return cols
+
+        # Calo hits (circles)
+        if n_calo > 0:
+            ax.scatter(
+                event_data["calo_hits"][:, 0], 
+                event_data["calo_hits"][:, 1], 
+                event_data["calo_hits"][:, 2],
+                c=get_colors(clusters[:n_calo]), marker='o', s=15, alpha=0.7, label='Calo Hits'
+            )
+            
+        # Tracker hits (triangles)
+        if tracker_hits.shape[0] > 0:
+            ax.scatter(
+                event_data["tracker_hits"][:, 0], 
+                event_data["tracker_hits"][:, 1], 
+                event_data["tracker_hits"][:, 2],
+                c=get_colors(clusters[n_calo:]), marker='^', s=8, alpha=0.5, label='Tracker Hits'
+            )
+            
+        ax.set_xlabel('X (normalized)')
+        ax.set_ylabel('Y (normalized)')
+        ax.set_zlabel('Z (normalized)')
+        ax.set_title(f'Event {event_data["event_id"]} - Epoch {epoch+1}\n(DBSCAN: {n_clusters_found} clusters found, black = noise)')
+        ax.legend()
+        
+        # Save plot
+        plot_path = os.path.join(output_dir, f"point_cloud_epoch_{epoch+1}_ev{i}.png")
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
 
 class PointNetEncoder(nn.Module):
     """Simple MLP-based encoder per hit."""
@@ -73,9 +163,11 @@ class MaskedPointModel(nn.Module):
         # Learned mask token
         self.mask_token = nn.Parameter(torch.randn(embed_dim))
         
-        # Transformer encoder
+        # Efficient Transformer encoder using scaled_dot_product_attention
+        # We use the standard TransformerEncoderLayer but ensure it uses the fast path
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=nhead, batch_first=True, activation='relu'
+            d_model=embed_dim, nhead=nhead, batch_first=True, activation='relu',
+            norm_first=True # Better for deep transformers
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
@@ -98,32 +190,50 @@ class MaskedPointModel(nn.Module):
         num_masked = int(N * mask_ratio)
         mask_indices = torch.rand(B, N, device=device).argsort(dim=1)[:, :num_masked]
         
-        # Prepare tokens for transformer (keep some original, mask some)
-        # For simplicity in this basic version, we replace masked tokens with self.mask_token
-        # and feed the entire sequence to the transformer.
+        # Prepare tokens for transformer
         input_embeddings = hit_embeddings.clone()
         for b in range(B):
             input_embeddings[b, mask_indices[b]] = self.mask_token
             
-        # Transformer processes all tokens
+        # Transformer processes all tokens (automatically uses FlashAttention if available)
         latent = self.transformer(input_embeddings) # (B, N, embed_dim)
         
-        # Reconstruct only the masked ones (for loss calculation, we can predict all and index)
+        # Reconstruct only the masked ones
         reconstructed = self.reconstructor(latent) # (B, N, 4)
         
-        return reconstructed, mask_indices
+        return reconstructed, mask_indices, latent
 
-def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4):
-    # Force CPU due to GPU incompatibility in this environment
+def compute_density(hits, radius=0.05):
+    """
+    Computes local density for hits.
+    hits: (N, 4) or (B, N, 4)
+    """
+    if len(hits.shape) == 2:
+        hits = hits.unsqueeze(0)
+    
+    B, N, C = hits.shape
+    coords = hits[:, :, :3] # (B, N, 3)
+    
+    # Pairwise distances
+    dist_sq = torch.cdist(coords, coords)**2
+    density = (dist_sq < radius**2).float().sum(dim=2) # (B, N)
+    return density
+
+def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4, 
+          output_dir="results", output_loss=None, use_neighborhood=True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    print(f"Config: num_hits={num_hits}, embed_dim={embed_dim}, max_events={max_events}")
+    print(f"Config: num_hits={num_hits}, embed_dim={embed_dim}, max_events={max_events}, neighborhood={use_neighborhood}")
+    
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Hyperparameters
     lr = 1e-3
     
-    # Dataset and Loader
-    full_dataset = CalorimeterDataset("train-00000-of-00100.parquet", num_hits=num_hits, max_events=max_events)
+    # Dataset Selection
+    if use_neighborhood:
+        full_dataset = NeighborhoodCalorimeterDataset(num_hits=num_hits, max_events=max_events)
+    else:
+        full_dataset = CalorimeterDataset(num_hits=num_hits, max_events=max_events)
     
     # Split into train and validation
     train_size = int(0.8 * len(full_dataset))
@@ -133,34 +243,29 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4):
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    # Model, Optimizer, Loss
     model = MaskedPointModel(embed_dim=embed_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    criterion = nn.MSELoss(reduction='none') # Need per-hit loss for density analysis
 
     # Training Loop
     for epoch in range(epochs):
-        # Training phase
         model.train()
         total_train_loss = 0
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
         
-        for batch_hits in pbar:
+        for i, batch_hits in enumerate(pbar):
             batch_hits = batch_hits.to(device)
+            reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=0.5)
             
-            # Forward pass
-            reconstructed, mask_indices = model(batch_hits, mask_ratio=0.5)
-            
-            # Extract only the masked original hits and predictions
-            masked_targets = []
-            masked_preds = []
+            # Extract masked targets and preds
+            all_masked_targets = []
+            all_masked_preds = []
             for b in range(batch_hits.shape[0]):
-                masked_targets.append(batch_hits[b, mask_indices[b]])
-                masked_preds.append(reconstructed[b, mask_indices[b]])
+                all_masked_targets.append(batch_hits[b, mask_indices[b]])
+                all_masked_preds.append(reconstructed[b, mask_indices[b]])
             
-            loss = criterion(torch.cat(masked_preds), torch.cat(masked_targets))
+            loss = nn.MSELoss()(torch.cat(all_masked_preds), torch.cat(all_masked_targets))
             
-            # Backward pass
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -171,32 +276,59 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4):
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"Epoch {epoch+1} Average Train Loss: {avg_train_loss:.6f}")
 
-        # Validation phase
+        # Validation phase with Density Analysis
         model.eval()
         total_val_loss = 0
+        density_stats = [] # Store (density, loss) tuples
+        
         with torch.no_grad():
             for batch_hits in val_dataloader:
                 batch_hits = batch_hits.to(device)
-                reconstructed, mask_indices = model(batch_hits, mask_ratio=0.5)
+                reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=0.5)
                 
-                masked_targets = []
-                masked_preds = []
+                densities = compute_density(batch_hits) # (B, N)
+                
                 for b in range(batch_hits.shape[0]):
-                    masked_targets.append(batch_hits[b, mask_indices[b]])
-                    masked_preds.append(reconstructed[b, mask_indices[b]])
+                    masked_targets = batch_hits[b, mask_indices[b]]
+                    masked_preds = reconstructed[b, mask_indices[b]]
+                    masked_densities = densities[b, mask_indices[b]]
+                    
+                    hit_losses = torch.mean((masked_targets - masked_preds)**2, dim=1)
+                    
+                    for d, l in zip(masked_densities.cpu().numpy(), hit_losses.cpu().numpy()):
+                        density_stats.append((d, l))
                 
-                loss = criterion(torch.cat(masked_preds), torch.cat(masked_targets))
-                total_val_loss += loss.item()
+                # Global val loss
+                total_val_loss += nn.MSELoss()(reconstructed, batch_hits).item()
         
         avg_val_loss = total_val_loss / len(val_dataloader)
         print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.6f}")
 
-    print("Pretraining complete!")
-    
+        # Plot Reconstruction Fidelity vs Density
+        if density_stats:
+            density_stats = np.array(density_stats)
+            plt.figure(figsize=(10, 6))
+            plt.hexbin(density_stats[:, 0], density_stats[:, 1], gridsize=30, cmap='YlOrRd', bins='log')
+            plt.colorbar(label='Log10(Count)')
+            plt.xlabel('Local Hit Density (Neighbors in radius 0.05)')
+            plt.ylabel('Reconstruction MSE')
+            plt.title(f'Fidelity vs Density - Epoch {epoch+1}')
+            plt.savefig(os.path.join(output_dir, f"fidelity_vs_density_epoch_{epoch+1}.png"))
+            plt.close()
+
+        # Generate 3D point cloud visualization with embedding-based coloring
+        visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=1)
+
     # Save model
-    save_path = f"checkpoint_h{num_hits}_e{embed_dim}.pth"
+    save_path = os.path.join(output_dir, f"checkpoint_h{num_hits}_e{embed_dim}_neigh{use_neighborhood}.pth")
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
+
+    if output_loss:
+        loss_file_path = os.path.join(output_dir, output_loss)
+        with open(loss_file_path, "w") as f:
+            f.write(f"{avg_val_loss:.6f}\n")
+        print(f"Loss saved to {loss_file_path}")
 
 if __name__ == "__main__":
     import argparse
@@ -204,14 +336,22 @@ if __name__ == "__main__":
     parser.add_argument("--num_hits", type=int, default=256)
     parser.add_argument("--embed_dim", type=int, default=16)
     parser.add_argument("--max_events", type=int, default=None)
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--output_dir", type=str, default="results")
+    parser.add_argument("--output_loss", type=str, default=None)
+    parser.add_argument("--neighborhood", type=str, choices=["True", "False"], default="True")
     args = parser.parse_args()
+    
+    use_neighborhood = args.neighborhood == "True"
     
     train(
         num_hits=args.num_hits,
         embed_dim=args.embed_dim,
         max_events=args.max_events,
         epochs=args.epochs,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        output_dir=args.output_dir,
+        output_loss=args.output_loss,
+        use_neighborhood=use_neighborhood
     )
