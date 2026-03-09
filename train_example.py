@@ -159,12 +159,15 @@ class PointNetEncoder(nn.Module):
         return self.mlp(x)
 
 class MaskedPointModel(nn.Module):
-    def __init__(self, embed_dim=128, nhead=8, num_layers=8):
+    def __init__(self, embed_dim=128, nhead=8, num_layers=8, max_len=1024):
         super().__init__()
         self.hit_encoder = PointNetEncoder(input_dim=4, embed_dim=embed_dim)
         
         # Learned mask token
         self.mask_token = nn.Parameter(torch.randn(embed_dim))
+        
+        # Positional embedding
+        self.pos_embed = nn.Parameter(torch.randn(1, max_len, embed_dim) * 0.02)
         
         # Efficient Transformer encoder using scaled_dot_product_attention
         # We use the standard TransformerEncoderLayer but ensure it uses the fast path
@@ -198,6 +201,9 @@ class MaskedPointModel(nn.Module):
         input_embeddings = hit_embeddings.clone()
         for b in range(B):
             input_embeddings[b, mask_indices[b]] = self.mask_token
+            
+        # Add positional embedding
+        input_embeddings = input_embeddings + self.pos_embed[:, :N, :]
             
         # Transformer processes all tokens (automatically uses FlashAttention if available)
         latent = self.transformer(input_embeddings) # (B, N, embed_dim)

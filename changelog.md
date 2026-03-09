@@ -1,5 +1,8 @@
 # Changelog
 
+## [Iteration 4]
+- Added random-initialized learned positional embeddings to `MaskedPointModel` to break permutation invariance for masked tokens. This allows the model to predict unique features for each masked hit.
+
 ## [Iteration 3]
 - Added `LayerNorm` to `PointNetEncoder` and `reconstructor` for better stability.
 - Increased `num_layers` of the Transformer from 4 to 8.
