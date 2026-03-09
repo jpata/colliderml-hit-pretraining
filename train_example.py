@@ -288,6 +288,15 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 batch_hits = batch_hits.to(device)
                 reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=0.5)
                 
+                # Extract masked targets and preds
+                all_masked_targets = []
+                all_masked_preds = []
+                for b in range(batch_hits.shape[0]):
+                    all_masked_targets.append(batch_hits[b, mask_indices[b]])
+                    all_masked_preds.append(reconstructed[b, mask_indices[b]])
+                
+                loss = nn.MSELoss()(torch.cat(all_masked_preds), torch.cat(all_masked_targets))
+                
                 densities = compute_density(batch_hits) # (B, N)
                 
                 for b in range(batch_hits.shape[0]):
@@ -301,7 +310,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                         density_stats.append((d, l))
                 
                 # Global val loss
-                total_val_loss += nn.MSELoss()(reconstructed, batch_hits).item()
+                total_val_loss += loss.item()
         
         avg_val_loss = total_val_loss / len(val_dataloader)
         print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.6f}")
@@ -340,9 +349,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_hits", type=int, default=256)
-    parser.add_argument("--embed_dim", type=int, default=16)
+    parser.add_argument("--embed_dim", type=int, default=64)
     parser.add_argument("--max_events", type=int, default=None)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--output_loss", type=str, default=None)
