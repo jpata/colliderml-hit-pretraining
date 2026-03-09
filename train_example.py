@@ -331,11 +331,21 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         # Plot Reconstruction Fidelity vs Density
         if density_stats:
             density_stats = np.array(density_stats)
+            
+            # Calculate correlation between log(density) and log(loss)
+            # Ensure values are positive for log calculation
+            valid_mask = (density_stats[:, 0] > 0) & (density_stats[:, 1] > 0)
+            if np.any(valid_mask):
+                log_density = np.log10(density_stats[valid_mask, 0])
+                log_loss = np.log10(density_stats[valid_mask, 1])
+                corr = np.corrcoef(log_density, log_loss)[0, 1]
+                print(f"Epoch {epoch+1} Log-Log Correlation (Density vs MAE): {corr:.4f}")
+
             plt.figure(figsize=(10, 6))
-            plt.hexbin(density_stats[:, 0], density_stats[:, 1], gridsize=30, cmap='YlOrRd', bins='log')
+            plt.hexbin(density_stats[:, 0], density_stats[:, 1], gridsize=30, cmap='YlOrRd', bins='log', xscale='log', yscale='log')
             plt.colorbar(label='Log10(Count)')
             plt.xlabel('Local Hit Density (Neighbors in radius 0.05)')
-            plt.ylabel('Reconstruction MSE')
+            plt.ylabel('Reconstruction MAE')
             plt.title(f'Fidelity vs Density - Epoch {epoch+1}')
             plt.savefig(os.path.join(output_dir, f"fidelity_vs_density_epoch_{epoch+1}.png"))
             plt.close()
