@@ -15,6 +15,10 @@ import umap
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from sklearn.cluster import DBSCAN
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.decomposition import PCA
+from scipy.stats import entropy
+import seaborn as sns
 import os
 
 def compute_all_hit_representations(model, hits, window_size=256, overlap=128):
@@ -64,6 +68,129 @@ def compute_all_hit_representations(model, hits, window_size=256, overlap=128):
     final_embeddings[z_indices] = final_sorted_embeddings
     return final_embeddings
 
+def compute_representation_metrics(all_embeddings, all_hits, epoch, output_dir):
+    """
+    Compute PCA, Clustering, and Correlation metrics to evaluate representation expressiveness.
+    """
+    metrics = {}
+    
+    # 1. PCA Explained Variance Entropy
+    pca = PCA(n_components=min(all_embeddings.shape[0], all_embeddings.shape[1], 16))
+    pca.fit(all_embeddings)
+    var_ratio = pca.explained_variance_ratio_
+    # Normalize variance ratio to sum to 1 and compute entropy as a measure of "effective dimensionality"
+    metrics["pca_entropy"] = entropy(var_ratio)
+    metrics["pca_top_1"] = var_ratio[0]
+    metrics["pca_top_3"] = np.sum(var_ratio[:3])
+    
+    # 2. Embedding-Input Correlation
+    # Compute correlation between each embedding dimension and (x, y, z, e)
+    # Using only a subset of dimensions for summary metric
+    corr_matrix = np.zeros((all_embeddings.shape[1], 4))
+    for i in range(all_embeddings.shape[1]):
+        for j in range(4):
+            corr_matrix[i, j] = np.abs(np.corrcoef(all_embeddings[:, i], all_hits[:, j])[0, 1])
+    
+    # Mean max correlation: how much does each embedding dimension "copy" an input feature
+    metrics["mean_max_input_corr"] = np.mean(np.max(corr_matrix, axis=1))
+    
+    # 3. Clustering Metrics (on a sample to keep it fast)
+    sample_size = min(len(all_embeddings), 2000)
+    indices = np.random.choice(len(all_embeddings), sample_size, replace=False)
+    emb_sample = all_embeddings[indices]
+    hits_sample = all_hits[indices]
+    
+    clustering = DBSCAN(eps=0.5, min_samples=3).fit(emb_sample)
+    labels = clustering.labels_
+    unique_labels = np.unique(labels)
+    n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+    metrics["n_clusters"] = n_clusters
+    
+    if n_clusters > 1:
+        # Silhouette score of the embeddings
+        valid_mask = labels != -1
+        if np.sum(valid_mask) > n_clusters:
+            metrics["silhouette"] = silhouette_score(emb_sample[valid_mask], labels[valid_mask])
+            
+            # Cluster Cohesion: Mean physical variance of hits within the same embedding cluster
+            cluster_vars = []
+            for l in unique_labels:
+                if l == -1: continue
+                c_hits = hits_sample[labels == l]
+                if len(c_hits) > 1:
+                    # Variance in x, y, z (normalized)
+                    cluster_vars.append(np.mean(np.var(c_hits[:, :3], axis=0)))
+            metrics["cluster_physical_cohesion"] = np.mean(cluster_vars) if cluster_vars else 0
+        else:
+            metrics["silhouette"] = 0
+            metrics["cluster_physical_cohesion"] = 0
+    else:
+        metrics["silhouette"] = 0
+        metrics["cluster_physical_cohesion"] = 0
+        
+    # Plot Correlation Heatmap
+    plt.figure(figsize=(8, 10))
+    sns.heatmap(corr_matrix, annot=False, cmap='viridis', xticklabels=['X', 'Y', 'Z', 'E'])
+    plt.title(f"Embedding-Feature Absolute Correlation - Epoch {epoch+1}")
+    plt.ylabel("Embedding Dimension")
+    plt.savefig(os.path.join(output_dir, f"feature_correlation_epoch_{epoch+1}.png"))
+    plt.close()
+    
+    return metrics
+
+def plot_metrics_history(history, output_dir):
+    """
+    Plot the evolution of representation metrics over epochs.
+    """
+    epochs = [h["epoch"] for h in history]
+    
+    fig, axs = plt.subplots(3, 2, figsize=(15, 18))
+    
+    # 1. Train and Validation Loss
+    axs[0, 0].plot(epochs, [h["train_loss"] for h in history], marker='o', label='Train Loss', color='blue')
+    axs[0, 0].plot(epochs, [h["val_loss"] for h in history], marker='o', label='Val Loss', color='orange')
+    axs[0, 0].set_title("Training & Validation Loss")
+    axs[0, 0].set_xlabel("Epoch")
+    axs[0, 0].set_yscale('log')
+    axs[0, 0].legend()
+    axs[0, 0].grid(True)
+    
+    # 2. PCA Entropy (Effective Dimension)
+    axs[0, 1].plot(epochs, [h["pca_entropy"] for h in history if "pca_entropy" in h], marker='o', color='green')
+    axs[0, 1].set_title("PCA Explained Variance Entropy (Effective Dim)")
+    axs[0, 1].set_xlabel("Epoch")
+    axs[0, 1].grid(True)
+    
+    # 3. Silhouette Score
+    axs[1, 0].plot(epochs, [h["silhouette"] for h in history if "silhouette" in h], marker='o', color='red')
+    axs[1, 0].set_title("Embedding Silhouette Score (DBSCAN Clusters)")
+    axs[1, 0].set_xlabel("Epoch")
+    axs[1, 0].grid(True)
+    
+    # 4. Density-Loss Log-Log Correlation
+    corrs = [h["density_corr"] for h in history if "density_corr" in h]
+    if corrs:
+        axs[1, 1].plot(epochs[:len(corrs)], corrs, marker='o', color='purple')
+    axs[1, 1].set_title("Density vs MAE Log-Log Correlation")
+    axs[1, 1].set_xlabel("Epoch")
+    axs[1, 1].grid(True)
+    
+    # 5. Cluster Physical Cohesion
+    axs[2, 0].plot(epochs, [h["cluster_physical_cohesion"] for h in history if "cluster_physical_cohesion" in h], marker='o', color='brown')
+    axs[2, 0].set_title("Mean Cluster Physical Spread (Lower is Better)")
+    axs[2, 0].set_xlabel("Epoch")
+    axs[2, 0].grid(True)
+    
+    # 6. Number of Clusters
+    axs[2, 1].plot(epochs, [h["n_clusters"] for h in history if "n_clusters" in h], marker='o', color='gray')
+    axs[2, 1].set_title("Number of DBSCAN Clusters Found")
+    axs[2, 1].set_xlabel("Epoch")
+    axs[2, 1].grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "representation_metrics_evolution.png"))
+    plt.close()
+
 def visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=2):
     """
     Visualize x, y, z point cloud of calo and tracker hits, 
@@ -90,7 +217,22 @@ def visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=2):
         clustering = DBSCAN(eps=0.5, min_samples=3).fit(embeddings_np)
         clusters = clustering.labels_
         
-        # Plotting
+        # 2D UMAP Visualization as well
+        if embeddings_np.shape[0] > 10:
+            try:
+                reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2)
+                embedding_2d = reducer.fit_transform(embeddings_np)
+                
+                plt.figure(figsize=(10, 8))
+                plt.scatter(embedding_2d[:, 0], embedding_2d[:, 1], c=clusters, cmap='tab20', s=10, alpha=0.6)
+                plt.colorbar(label='DBSCAN Cluster ID')
+                plt.title(f"UMAP Projection of Hit Embeddings - Event {i}, Epoch {epoch+1}")
+                plt.savefig(os.path.join(output_dir, f"umap_epoch_{epoch+1}_ev{i}.png"))
+                plt.close()
+            except Exception as e:
+                print(f"UMAP failed for event {i}: {e}")
+
+        # 3D Plotting
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection='3d')
         
@@ -213,7 +355,7 @@ class MaskedPointModel(nn.Module):
         
         return reconstructed, mask_indices, latent
 
-def compute_density(hits, radius=0.05):
+def compute_density(hits, radius=0.02):
     """
     Computes local density for hits.
     hits: (N, 4) or (B, N, 4)
@@ -258,6 +400,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
 
     # Training Loop
     epoch_losses = []
+    metrics_history = []
     for epoch in range(epochs):
         model.train()
         total_train_loss = 0
@@ -288,10 +431,13 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         avg_train_loss = total_train_loss / num_batches
         print(f"Epoch {epoch+1} Average Train Loss: {avg_train_loss:.6f}")
 
-        # Validation phase with Density Analysis
+        # Validation phase with Density Analysis and Representation Quality
         model.eval()
         total_val_loss = 0
         density_stats = [] # Store (density, loss) tuples
+        
+        val_embeddings_sample = []
+        val_hits_sample = []
         
         with torch.no_grad():
             total_coord_loss = 0
@@ -302,6 +448,11 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 batch_hits = batch_hits.to(device)
                 reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=mask_ratio)
                 
+                # Collect a subset for representation analysis
+                if v_batches <= 10: # Sample from first 10 batches
+                    val_embeddings_sample.append(latent.cpu().numpy().reshape(-1, embed_dim))
+                    val_hits_sample.append(batch_hits.cpu().numpy().reshape(-1, 4))
+
                 # Extract masked targets and preds
                 for b in range(batch_hits.shape[0]):
                     masked_targets = batch_hits[b, mask_indices[b]]
@@ -336,7 +487,25 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         avg_energy_loss = total_energy_loss / (v_batches * batch_size)
         print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.6f} (Coord: {avg_coord_loss:.6f}, Energy: {avg_energy_loss:.6f})")
         
-        epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss, avg_coord_loss, avg_energy_loss))
+        # Consolidate metrics for history
+        epoch_stats = {
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+            "coord_loss": avg_coord_loss,
+            "energy_loss": avg_energy_loss
+        }
+
+        # Compute and log representation metrics
+        if val_embeddings_sample:
+            all_emb = np.concatenate(val_embeddings_sample, axis=0)
+            all_hits = np.concatenate(val_hits_sample, axis=0)
+            rep_metrics = compute_representation_metrics(all_emb, all_hits, epoch, output_dir)
+            epoch_stats.update(rep_metrics)
+            
+            print(f"Epoch {epoch+1} Representation: PCA Entropy: {rep_metrics['pca_entropy']:.3f}, "
+                  f"Silhouette: {rep_metrics['silhouette']:.3f}, Clusters: {rep_metrics['n_clusters']}, "
+                  f"Physical Cohesion: {rep_metrics['cluster_physical_cohesion']:.4f}")
 
         # Plot Reconstruction Fidelity vs Density
         if density_stats:
@@ -349,16 +518,21 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 log_density = np.log10(density_stats[valid_mask, 0])
                 log_loss = np.log10(density_stats[valid_mask, 1])
                 corr = np.corrcoef(log_density, log_loss)[0, 1]
+                epoch_stats["density_corr"] = corr
                 print(f"Epoch {epoch+1} Log-Log Correlation (Density vs MAE): {corr:.4f}")
 
             plt.figure(figsize=(10, 6))
-            plt.hexbin(density_stats[:, 0], density_stats[:, 1], gridsize=50, cmap='YlOrRd', bins='log', xscale='log', yscale='log')
+            plt.hexbin(density_stats[:, 0], density_stats[:, 1], gridsize=100, cmap='YlOrRd', bins='log', xscale='log', yscale='log')
             plt.colorbar(label='Log10(Count)')
             plt.xlabel('Local Hit Density (Neighbors in radius 0.05)')
             plt.ylabel('Reconstruction MAE')
             plt.title(f'Fidelity vs Density - Epoch {epoch+1}')
             plt.savefig(os.path.join(output_dir, f"fidelity_vs_density_epoch_{epoch+1}.png"))
             plt.close()
+
+        metrics_history.append(epoch_stats)
+        plot_metrics_history(metrics_history, output_dir)
+        epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss, avg_coord_loss, avg_energy_loss))
 
         # Generate 3D point cloud visualization with embedding-based coloring
         visualize_embeddings_3d(model, train_dataset, epoch, output_dir, n_events=1)

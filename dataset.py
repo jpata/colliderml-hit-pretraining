@@ -35,6 +35,12 @@ class CalorimeterDataset(IterableDataset):
         self.coord_scale = 5000.0
         self.required_cols = ["x", "y", "z", "total_energy"]
 
+    def __len__(self):
+        total = len(self.shards) * self.rows_per_shard
+        if self.max_events is not None:
+            return min(self.max_events, total)
+        return total
+
     def _process_chunk(self, df):
         """Processes a chunk of events into a list of hit arrays using manual conversion."""
         events = []
@@ -50,7 +56,7 @@ class CalorimeterDataset(IterableDataset):
             x = np.array(x_lists[i], dtype=np.float32) / self.coord_scale
             y = np.array(y_lists[i], dtype=np.float32) / self.coord_scale
             z = np.array(z_lists[i], dtype=np.float32) / self.coord_scale
-            e = np.log10(np.array(e_lists[i], dtype=np.float32) + 1.0)
+            e = np.log10(np.array(e_lists[i], dtype=np.float32) / 1e-6 + 1.0)
             events.append(np.stack([x, y, z, e], axis=1))
             
         return events
@@ -59,9 +65,17 @@ class CalorimeterDataset(IterableDataset):
         worker_info = get_worker_info()
         if worker_info is None:
             shards = self.shards
+            max_events = self.max_events
         else:
             # Partition shards among workers
             shards = self.shards[worker_info.id::worker_info.num_workers]
+            if self.max_events is not None:
+                # Divide max_events by number of workers, assigning remainders to first workers
+                max_events = self.max_events // worker_info.num_workers
+                if worker_info.id < self.max_events % worker_info.num_workers:
+                    max_events += 1
+            else:
+                max_events = None
             
         events_yielded = 0
         
@@ -73,7 +87,7 @@ class CalorimeterDataset(IterableDataset):
             lf = pl.scan_parquet(shard_path, low_memory=True)
             
             for start in range(0, self.rows_per_shard, self.chunk_size):
-                if self.max_events and events_yielded >= self.max_events:
+                if max_events is not None and events_yielded >= max_events:
                     return
                 
                 num_to_load = min(self.chunk_size, self.rows_per_shard - start)
@@ -91,7 +105,7 @@ class CalorimeterDataset(IterableDataset):
                 
                 # Yield each event
                 for raw_hits in raw_events:
-                    if self.max_events and events_yielded >= self.max_events:
+                    if max_events is not None and events_yielded >= max_events:
                         return
                         
                     processed = self._finalize_event(raw_hits, events_yielded)
@@ -122,7 +136,7 @@ class CalorimeterDataset(IterableDataset):
         x = np.concatenate(df["x"].to_numpy()) / self.coord_scale
         y = np.concatenate(df["y"].to_numpy()) / self.coord_scale
         z = np.concatenate(df["z"].to_numpy()) / self.coord_scale
-        e = np.log10(np.concatenate(df["total_energy"].to_numpy()) + 1.0)
+        e = np.log10(np.concatenate(df["total_energy"].to_numpy()) / 1e-6 + 1.0)
         hits = np.stack([x, y, z, e], axis=1).astype(np.float32)
         
         return {
