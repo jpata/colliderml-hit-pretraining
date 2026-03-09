@@ -7,10 +7,10 @@ Achieve convergence of the validation loss for the Masked Point Modeling task.
 
 ## Current Strategy
 *   **Base Model:** Transformer encoder with PointNet hit embeddings.
-*   **Task:** Masked Point Modeling (reconstruct x, y, z, e of 50% masked hits).
+*   **Task:** Masked Point Modeling (reconstruct x, y, z, e of **75%** masked hits).
 *   **Loss:** SmoothL1Loss on masked hits.
-*   **Optimization:** Adam with Cosine Annealing.
-*   **Data:** `NeighborhoodCalorimeterDataset` for local correlation focus.
+*   **Optimization:** Adam with Cosine Annealing, **LR=3e-4**.
+*   **Data:** `NeighborhoodCalorimeterDataset` with **2000** events.
 *   **Additional Metrics:** Monitor reconstruction fidelity vs density and 3D embedding clusters.
 
 ## Iterative Process (Up to 10 iterations)

@@ -230,15 +230,14 @@ def compute_density(hits, radius=0.05):
     return density
 
 def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4, 
-          output_dir="results", output_loss=None, use_neighborhood=True):
+          output_dir="results", output_loss=None, use_neighborhood=True, 
+          mask_ratio=0.5, lr=1e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    print(f"Config: num_hits={num_hits}, embed_dim={embed_dim}, max_events={max_events}, neighborhood={use_neighborhood}")
+    print(f"Config: num_hits={num_hits}, embed_dim={embed_dim}, max_events={max_events}, neighborhood={use_neighborhood}, mask_ratio={mask_ratio}, lr={lr}")
     
     os.makedirs(output_dir, exist_ok=True)
 
-    lr = 1e-4
-    
     # Dataset Selection
     if use_neighborhood:
         full_dataset = NeighborhoodCalorimeterDataset(num_hits=num_hits, max_events=max_events)
@@ -267,7 +266,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         
         for i, batch_hits in enumerate(pbar):
             batch_hits = batch_hits.to(device)
-            reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=0.5)
+            reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=mask_ratio)
             
             # Extract masked targets and preds
             all_masked_targets = []
@@ -297,7 +296,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         with torch.no_grad():
             for batch_hits in val_dataloader:
                 batch_hits = batch_hits.to(device)
-                reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=0.5)
+                reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=mask_ratio)
                 
                 # Extract masked targets and preds
                 all_masked_targets = []
@@ -377,6 +376,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--output_loss", type=str, default=None)
     parser.add_argument("--neighborhood", type=str, choices=["True", "False"], default="True")
+    parser.add_argument("--mask_ratio", type=float, default=0.5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
     
     use_neighborhood = args.neighborhood == "True"
@@ -389,5 +390,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         output_dir=args.output_dir,
         output_loss=args.output_loss,
-        use_neighborhood=use_neighborhood
+        use_neighborhood=use_neighborhood,
+        mask_ratio=args.mask_ratio,
+        lr=args.lr
     )
