@@ -1,5 +1,11 @@
 # Changelog
 
+## [Iteration 10]
+- Increased training to 20 epochs for better convergence.
+- Observed that `energy_loss` (~0.0029) is significantly higher than `coord_loss` (~0.0003), indicating that energy reconstruction is the main bottleneck.
+- Correlation between density and MAE remained stable at ~ -0.70.
+- Overall `val_loss` converged to ~0.0035.
+
 ## [Iteration 9]
 - Reverted to `neighborhood=True` (local neighborhood sampling) as per the convergence study strategy in `convergence.md`.
 - Set `num_hits=256` and `mask_ratio=0.75`.
