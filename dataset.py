@@ -12,8 +12,33 @@ import os
 import time
 import polars as pl
 from pathlib import Path
+from hilbert import hilbert_index_3d
 
 class CalorimeterDataset(IterableDataset):
+    @staticmethod
+    def compute_local_features(hits, radii=[0.01, 0.02, 0.05]):
+        """
+        Precomputes multi-scale local density and energy-weighted features using scipy.
+        This is an offline version of the feature computation for use in dataset generation.
+        hits: (N, 4) array of (x, y, z, e)
+        Returns: (N, 2 * len(radii)) array
+        """
+        from scipy.spatial import KDTree
+        tree = KDTree(hits[:, :3])
+        features = []
+        for r in radii:
+            # Multi-scale Density (Log-scaled)
+            counts = tree.query_ball_point(hits[:, :3], r, return_length=True)
+            features.append(np.log10(counts.astype(np.float32) + 1.0))
+            
+            # Local Energy Sum (Log-scaled)
+            # Find neighbors for each hit and sum their energies
+            indices = tree.query_ball_point(hits[:, :3], r)
+            e_sums = np.array([hits[idx, 3].sum() for idx in indices], dtype=np.float32)
+            features.append(np.log10(e_sums + 1.0))
+            
+        return np.stack(features, axis=1)
+
     def __init__(self, num_hits=2048, max_events=None, verbose=False, chunk_size=20):
         self.verbose = verbose
         self.num_hits = num_hits
@@ -22,69 +47,103 @@ class CalorimeterDataset(IterableDataset):
         
         # Identify shards dynamically from cache
         cache_root = Path("~/.cache/colliderml").expanduser()
-        self.shard_dir = cache_root / "CERN__ColliderML-Release-1/ttbar_pu0_calo_hits/data/ttbar_pu0_calo_hits"
+        release_root = cache_root / "CERN__ColliderML-Release-1"
+        self.calo_dir = release_root / "ttbar_pu0_calo_hits/data/ttbar_pu0_calo_hits"
+        self.tracker_dir = release_root / "ttbar_pu0_tracker_hits/data/ttbar_pu0_tracker_hits"
         
-        if not self.shard_dir.exists():
-            raise FileNotFoundError(f"Shard directory {self.shard_dir} not found.")
+        if not self.calo_dir.exists():
+            raise FileNotFoundError(f"Calo shard directory {self.calo_dir} not found.")
         
-        self.shards = sorted(list(self.shard_dir.glob("train-*.parquet")))
-        if not self.shards:
-            raise FileNotFoundError(f"No parquet shards found in {self.shard_dir}")
+        self.calo_shards = sorted(list(self.calo_dir.glob("train-*.parquet")))
+        if not self.calo_shards:
+            raise FileNotFoundError(f"No parquet shards found in {self.calo_dir}")
+        
+        # We assume tracker shards match calo shards one-to-one
+        self.tracker_shards = sorted(list(self.tracker_dir.glob("train-*.parquet"))) if self.tracker_dir.exists() else []
 
         self.rows_per_shard = 1000
         self.coord_scale = 5000.0
-        self.required_cols = ["x", "y", "z", "total_energy"]
+        self.tracker_energy_const = 2.6 # Approx mean log-energy of calo hits
+        self.required_cols_calo = ["x", "y", "z", "total_energy"]
+        self.required_cols_tracker = ["x", "y", "z"]
 
     def __len__(self):
-        total = len(self.shards) * self.rows_per_shard
+        total = len(self.calo_shards) * self.rows_per_shard
         if self.max_events is not None:
             return min(self.max_events, total)
         return total
 
-    def _process_chunk(self, df):
-        """Processes a chunk of events into a list of hit arrays using manual conversion."""
+    def _process_chunk(self, calo_df, tracker_df=None):
+        """Processes a chunk of events into a list of hit arrays with hit type flag."""
         events = []
-        # Convert columns to numpy once per chunk
-        # Note: Polars Series of Lists to numpy returns a nested numpy array (object type)
-        # We manually convert each list to a flat float32 array
-        x_lists = df["x"].to_list()
-        y_lists = df["y"].to_list()
-        z_lists = df["z"].to_list()
-        e_lists = df["total_energy"].to_list()
         
-        for i in range(len(x_lists)):
-            x = np.array(x_lists[i], dtype=np.float32) / self.coord_scale
-            y = np.array(y_lists[i], dtype=np.float32) / self.coord_scale
-            z = np.array(z_lists[i], dtype=np.float32) / self.coord_scale
-            e = np.log10(np.array(e_lists[i], dtype=np.float32) / 1e-6 + 1.0)
-            events.append(np.stack([x, y, z, e], axis=1))
+        # Calo columns
+        c_x_lists = calo_df["x"].to_list()
+        c_y_lists = calo_df["y"].to_list()
+        c_z_lists = calo_df["z"].to_list()
+        c_e_lists = calo_df["total_energy"].to_list()
+        
+        # Tracker columns
+        t_x_lists = tracker_df["x"].to_list() if tracker_df is not None else [[] for _ in range(len(c_x_lists))]
+        t_y_lists = tracker_df["y"].to_list() if tracker_df is not None else [[] for _ in range(len(c_x_lists))]
+        t_z_lists = tracker_df["z"].to_list() if tracker_df is not None else [[] for _ in range(len(c_x_lists))]
+        
+        for i in range(len(c_x_lists)):
+            # Calorimeter Hits (Type 0)
+            cx = np.array(c_x_lists[i], dtype=np.float32) / self.coord_scale
+            cy = np.array(c_y_lists[i], dtype=np.float32) / self.coord_scale
+            cz = np.array(c_z_lists[i], dtype=np.float32) / self.coord_scale
+            ce = np.log10(np.array(c_e_lists[i], dtype=np.float32) / 1e-6 + 1.0)
+            ctype = np.zeros_like(cx)
+            
+            # Tracker Hits (Type 1)
+            tx = np.array(t_x_lists[i], dtype=np.float32) / self.coord_scale
+            ty = np.array(t_y_lists[i], dtype=np.float32) / self.coord_scale
+            tz = np.array(t_z_lists[i], dtype=np.float32) / self.coord_scale
+            te = np.full_like(tx, self.tracker_energy_const)
+            ttype = np.ones_like(tx)
+            
+            # Combine all hits: (N, 5) -> (x, y, z, e, type)
+            x = np.concatenate([cx, tx])
+            y = np.concatenate([cy, ty])
+            z = np.concatenate([cz, tz])
+            e = np.concatenate([ce, te])
+            h_type = np.concatenate([ctype, ttype])
+            
+            events.append(np.stack([x, y, z, e, h_type], axis=1))
             
         return events
 
     def __iter__(self):
         worker_info = get_worker_info()
         if worker_info is None:
-            shards = self.shards
+            calo_shards = self.calo_shards
+            tracker_shards = self.tracker_shards
             max_events = self.max_events
         else:
             # Partition shards among workers
-            shards = self.shards[worker_info.id::worker_info.num_workers]
+            idx = worker_info.id
+            num_workers = worker_info.num_workers
+            calo_shards = self.calo_shards[idx::num_workers]
+            tracker_shards = self.tracker_shards[idx::num_workers] if self.tracker_shards else []
+            
             if self.max_events is not None:
-                # Divide max_events by number of workers, assigning remainders to first workers
-                max_events = self.max_events // worker_info.num_workers
-                if worker_info.id < self.max_events % worker_info.num_workers:
+                max_events = self.max_events // num_workers
+                if idx < self.max_events % num_workers:
                     max_events += 1
             else:
                 max_events = None
             
         events_yielded = 0
         
-        for shard_path in shards:
-            if self.verbose:
-                print(f"Worker {os.getpid()} processing shard {shard_path.name}")
+        for i, calo_path in enumerate(calo_shards):
+            tracker_path = tracker_shards[i] if tracker_shards else None
             
-            # Use scan_parquet for efficient slicing
-            lf = pl.scan_parquet(shard_path, low_memory=True)
+            if self.verbose:
+                print(f"Worker {os.getpid()} processing calo shard {calo_path.name}")
+            
+            l_calo = pl.scan_parquet(calo_path, low_memory=True)
+            l_tracker = pl.scan_parquet(tracker_path, low_memory=True) if tracker_path else None
             
             for start in range(0, self.rows_per_shard, self.chunk_size):
                 if max_events is not None and events_yielded >= max_events:
@@ -93,24 +152,29 @@ class CalorimeterDataset(IterableDataset):
                 num_to_load = min(self.chunk_size, self.rows_per_shard - start)
                 
                 try:
-                    # Efficiently load ONLY the chunk
-                    chunk_df = lf.slice(start, num_to_load).collect()
+                    c_chunk = l_calo.slice(start, num_to_load).collect()
+                    t_chunk = l_tracker.slice(start, num_to_load).collect() if l_tracker is not None else None
                 except Exception as e:
                     if self.verbose:
-                        print(f"Error reading chunk from {shard_path}: {e}")
+                        print(f"Error reading chunk: {e}")
                     break
                 
-                # Process chunk into list of arrays
-                raw_events = self._process_chunk(chunk_df)
+                raw_events = self._process_chunk(c_chunk, t_chunk)
                 
-                # Yield each event
                 for raw_hits in raw_events:
                     if max_events is not None and events_yielded >= max_events:
                         return
-                        
                     processed = self._finalize_event(raw_hits, events_yielded)
                     yield processed
                     events_yielded += 1
+
+    def _sort_hits(self, hits):
+        """Sorts hits based on Morton/Hilbert index for spatial locality."""
+        # Avoid sorting the padding (0,0,0)
+        coords = hits[:, :3]
+        indices = hilbert_index_3d(coords)
+        sort_idx = np.argsort(indices)
+        return hits[sort_idx]
 
     def _finalize_event(self, hits, event_idx):
         n_hits = hits.shape[0]
@@ -120,29 +184,36 @@ class CalorimeterDataset(IterableDataset):
             indices = rng.choice(n_hits, self.num_hits, replace=False)
             hits = hits[indices]
         else:
-            padding = np.zeros((self.num_hits - n_hits, 4), dtype=np.float32)
+            padding = np.zeros((self.num_hits - n_hits, 5), dtype=np.float32)
             hits = np.concatenate([hits, padding], axis=0)
             
+        # Sort for spatial locality
+        hits = self._sort_hits(hits)
         return torch.from_numpy(hits)
 
     def get_full_event(self, idx):
         """Sparse access for visualization only."""
         shard_idx = idx // self.rows_per_shard
         rel_idx = idx % self.rows_per_shard
-        shard_path = self.shards[shard_idx]
         
-        df = pl.read_parquet(shard_path, columns=self.required_cols).slice(rel_idx, 1)
+        c_path = self.calo_shards[shard_idx]
+        t_path = self.tracker_shards[shard_idx] if self.tracker_shards else None
         
-        x = np.concatenate(df["x"].to_numpy()) / self.coord_scale
-        y = np.concatenate(df["y"].to_numpy()) / self.coord_scale
-        z = np.concatenate(df["z"].to_numpy()) / self.coord_scale
-        e = np.log10(np.concatenate(df["total_energy"].to_numpy()) / 1e-6 + 1.0)
-        hits = np.stack([x, y, z, e], axis=1).astype(np.float32)
+        c_df = pl.read_parquet(c_path, columns=self.required_cols_calo).slice(rel_idx, 1)
+        t_df = pl.read_parquet(t_path, columns=self.required_cols_tracker).slice(rel_idx, 1) if t_path else None
+        
+        # Reuse process_chunk logic
+        raw_hits = self._process_chunk(c_df, t_df)[0]
+        
+        # Split back for visualization API compatibility
+        calo_mask = raw_hits[:, 4] == 0
+        tracker_mask = raw_hits[:, 4] == 1
         
         return {
             "event_id": idx,
-            "calo_hits": hits,
-            "tracker_hits": np.zeros((0, 4), dtype=np.float32)
+            "calo_hits": raw_hits[calo_mask, :4],
+            "tracker_hits": raw_hits[tracker_mask, :4],
+            "all_hits": raw_hits # (N, 5)
         }
 
 class NeighborhoodCalorimeterDataset(CalorimeterDataset):
@@ -151,8 +222,8 @@ class NeighborhoodCalorimeterDataset(CalorimeterDataset):
         rng = np.random.default_rng(seed=event_idx)
 
         if n_hits <= self.num_hits:
-            padding = np.zeros((self.num_hits - n_hits, 4), dtype=np.float32)
-            result = torch.from_numpy(np.concatenate([hits, padding], axis=0))
+            padding = np.zeros((self.num_hits - n_hits, 5), dtype=np.float32)
+            hits = np.concatenate([hits, padding], axis=0)
         else:
             e = hits[:, 3]
             probs = e / (e.sum() + 1e-9)
@@ -161,11 +232,11 @@ class NeighborhoodCalorimeterDataset(CalorimeterDataset):
             
             dists = np.sum((hits[:, :3] - seed_pos)**2, axis=1)
             neighbor_indices = np.argpartition(dists, self.num_hits)[:self.num_hits]
-            neighbor_indices = neighbor_indices[np.argsort(dists[neighbor_indices])]
+            hits = hits[neighbor_indices]
             
-            result = torch.from_numpy(hits[neighbor_indices])
-            
-        return result
+        # Sort for spatial locality
+        hits = self._sort_hits(hits)
+        return torch.from_numpy(hits)
 
 if __name__ == "__main__":
     ds = CalorimeterDataset(num_hits=1024, max_events=50, verbose=True)
