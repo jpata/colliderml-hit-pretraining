@@ -254,9 +254,9 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
     model = MaskedPointModel(embed_dim=embed_dim).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    criterion = nn.MSELoss(reduction='none') # Need per-hit loss for density analysis
+    criterion = nn.SmoothL1Loss(reduction='none') # Need per-hit loss for density analysis
 
     # Training Loop
     epoch_losses = []
@@ -276,7 +276,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 all_masked_targets.append(batch_hits[b, mask_indices[b]])
                 all_masked_preds.append(reconstructed[b, mask_indices[b]])
             
-            loss = nn.MSELoss()(torch.cat(all_masked_preds), torch.cat(all_masked_targets))
+            loss = nn.SmoothL1Loss()(torch.cat(all_masked_preds), torch.cat(all_masked_targets))
             
             optimizer.zero_grad()
             loss.backward()
@@ -306,7 +306,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                     all_masked_targets.append(batch_hits[b, mask_indices[b]])
                     all_masked_preds.append(reconstructed[b, mask_indices[b]])
                 
-                loss = nn.MSELoss()(torch.cat(all_masked_preds), torch.cat(all_masked_targets))
+                loss = nn.SmoothL1Loss()(torch.cat(all_masked_preds), torch.cat(all_masked_targets))
                 
                 densities = compute_density(batch_hits) # (B, N)
                 
@@ -315,7 +315,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                     masked_preds = reconstructed[b, mask_indices[b]]
                     masked_densities = densities[b, mask_indices[b]]
                     
-                    hit_losses = torch.mean((masked_targets - masked_preds)**2, dim=1)
+                    hit_losses = torch.mean(torch.abs(masked_targets - masked_preds), dim=1)
                     
                     for d, l in zip(masked_densities.cpu().numpy(), hit_losses.cpu().numpy()):
                         density_stats.append((d, l))
@@ -360,9 +360,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_hits", type=int, default=256)
-    parser.add_argument("--embed_dim", type=int, default=64)
+    parser.add_argument("--embed_dim", type=int, default=128)
     parser.add_argument("--max_events", type=int, default=None)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--output_loss", type=str, default=None)

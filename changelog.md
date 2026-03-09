@@ -1,5 +1,10 @@
 # Changelog
 
+## [Iteration 5]
+- Switched from `MSELoss` to `SmoothL1Loss` for more robust reconstruction.
+- Added `weight_decay=1e-5` to `Adam` optimizer.
+- Increased `embed_dim` to 128 and `epochs` to 20 for better capacity and learning time.
+
 ## [Iteration 4]
 - Added random-initialized learned positional embeddings to `MaskedPointModel` to break permutation invariance for masked tokens. This allows the model to predict unique features for each masked hit.
 
