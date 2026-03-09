@@ -1,5 +1,12 @@
 # Changelog
 
+## [Iteration 11]
+- Implemented log-scaling for energy: `log10(energy + 1)`.
+- Increased `num_hits` from 256 to 512 (Curriculum Learning).
+- Observed dramatic improvement in `energy_loss` (~0.000003 on log-scale), now much lower than `coord_loss` (~0.0005).
+- Correlation between density and MAE increased to ~ -0.79.
+- Overall `val_loss` reached ~0.0011.
+
 ## [Iteration 10]
 - Increased training to 20 epochs for better convergence.
 - Observed that `energy_loss` (~0.0029) is significantly higher than `coord_loss` (~0.0003), indicating that energy reconstruction is the main bottleneck.

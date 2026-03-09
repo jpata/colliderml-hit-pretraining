@@ -69,7 +69,7 @@ class CalorimeterDataset(Dataset):
         x = np.concatenate(event["x"].to_numpy()) / self.coord_scale
         y = np.concatenate(event["y"].to_numpy()) / self.coord_scale
         z = np.concatenate(event["z"].to_numpy()) / self.coord_scale
-        e = np.concatenate(event["total_energy"].to_numpy()) / self.energy_scale
+        e = np.log10(np.concatenate(event["total_energy"].to_numpy()) + 1.0)
         
         # Combine into a single hit array (N, 4)
         hits = np.stack([x, y, z, e], axis=1).astype(np.float32)
@@ -107,7 +107,7 @@ class CalorimeterDataset(Dataset):
             y = np.concatenate(df["y"].to_numpy()) / self.coord_scale
             z = np.concatenate(df["z"].to_numpy()) / self.coord_scale
             if "total_energy" in df.columns:
-                e = np.concatenate(df["total_energy"].to_numpy()) / self.energy_scale
+                e = np.log10(np.concatenate(df["total_energy"].to_numpy()) + 1.0)
             else:
                 # Assign a small dummy energy for tracker hits if missing
                 e = np.ones_like(x) * 0.01 
@@ -146,7 +146,7 @@ class NeighborhoodCalorimeterDataset(CalorimeterDataset):
         x = np.concatenate(event["x"].to_numpy()) / self.coord_scale
         y = np.concatenate(event["y"].to_numpy()) / self.coord_scale
         z = np.concatenate(event["z"].to_numpy()) / self.coord_scale
-        e = np.concatenate(event["total_energy"].to_numpy()) / self.energy_scale
+        e = np.log10(np.concatenate(event["total_energy"].to_numpy()) + 1.0)
         
         hits = np.stack([x, y, z, e], axis=1).astype(np.float32)
         n_hits = hits.shape[0]
@@ -227,11 +227,11 @@ def validate_dataset(max_events=100, output_dir="validation_plots", verbose=True
         if feat in ['x', 'y', 'z']:
             data = data / dataset.coord_scale
         else:
-            data = data / dataset.energy_scale
+            data = np.log10(data + 1.0)
             
         axes[i].hist(data, bins=50, color='skyblue', edgecolor='black')
         axes[i].set_title(f'Calo Hit Distribution: {feat}')
-        axes[i].set_xlabel('Normalized Value' if feat != 'total_energy' else 'Normalized Energy')
+        axes[i].set_xlabel('Normalized Value' if feat != 'total_energy' else 'Log10(1 + Energy)')
         axes[i].set_ylabel('Frequency')
         axes[i].grid(True, alpha=0.3)
     plt.tight_layout()
