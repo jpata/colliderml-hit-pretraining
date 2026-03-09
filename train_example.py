@@ -246,6 +246,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     
     model = MaskedPointModel(embed_dim=embed_dim).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.MSELoss(reduction='none') # Need per-hit loss for density analysis
 
     # Training Loop
@@ -274,7 +275,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             
             total_train_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
-            
+        
+        scheduler.step()
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"Epoch {epoch+1} Average Train Loss: {avg_train_loss:.6f}")
 
@@ -352,7 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--embed_dim", type=int, default=64)
     parser.add_argument("--max_events", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--output_loss", type=str, default=None)
     parser.add_argument("--neighborhood", type=str, choices=["True", "False"], default="True")
