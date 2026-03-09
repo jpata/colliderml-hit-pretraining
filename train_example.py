@@ -294,18 +294,25 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         density_stats = [] # Store (density, loss) tuples
         
         with torch.no_grad():
+            total_coord_loss = 0
+            total_energy_loss = 0
             for batch_hits in val_dataloader:
                 batch_hits = batch_hits.to(device)
                 reconstructed, mask_indices, latent = model(batch_hits, mask_ratio=mask_ratio)
                 
                 # Extract masked targets and preds
-                all_masked_targets = []
-                all_masked_preds = []
                 for b in range(batch_hits.shape[0]):
-                    all_masked_targets.append(batch_hits[b, mask_indices[b]])
-                    all_masked_preds.append(reconstructed[b, mask_indices[b]])
+                    masked_targets = batch_hits[b, mask_indices[b]]
+                    masked_preds = reconstructed[b, mask_indices[b]]
+                    
+                    # Separate coordinate (x,y,z) and energy (e) losses
+                    coord_loss = nn.SmoothL1Loss()(masked_preds[:, :3], masked_targets[:, :3])
+                    energy_loss = nn.SmoothL1Loss()(masked_preds[:, 3:], masked_targets[:, 3:])
+                    
+                    total_coord_loss += coord_loss.item()
+                    total_energy_loss += energy_loss.item()
                 
-                loss = nn.SmoothL1Loss()(torch.cat(all_masked_preds), torch.cat(all_masked_targets))
+                loss = nn.SmoothL1Loss()(reconstructed, batch_hits) # Overkill but simple
                 
                 densities = compute_density(batch_hits) # (B, N)
                 
@@ -323,9 +330,11 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 total_val_loss += loss.item()
         
         avg_val_loss = total_val_loss / len(val_dataloader)
-        print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.6f}")
+        avg_coord_loss = total_coord_loss / (len(val_dataloader) * batch_size)
+        avg_energy_loss = total_energy_loss / (len(val_dataloader) * batch_size)
+        print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.6f} (Coord: {avg_coord_loss:.6f}, Energy: {avg_energy_loss:.6f})")
         
-        epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss))
+        epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss, avg_coord_loss, avg_energy_loss))
 
         # Plot Reconstruction Fidelity vs Density
         if density_stats:
@@ -360,9 +369,9 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     if output_loss:
         loss_file_path = os.path.join(output_dir, output_loss)
         with open(loss_file_path, "w") as f:
-            f.write("epoch,train_loss,val_loss\n")
-            for e, t, v in epoch_losses:
-                f.write(f"{e},{t:.6f},{v:.6f}\n")
+            f.write("epoch,train_loss,val_loss,coord_loss,energy_loss\n")
+            for e, t, v, c, en in epoch_losses:
+                f.write(f"{e},{t:.6f},{v:.6f},{c:.6f},{en:.6f}\n")
         print(f"Losses saved to {loss_file_path}")
 
 if __name__ == "__main__":

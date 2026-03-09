@@ -1,5 +1,11 @@
 # Changelog
 
+## [Iteration 9]
+- Reverted to `neighborhood=True` (local neighborhood sampling) as per the convergence study strategy in `convergence.md`.
+- Set `num_hits=256` and `mask_ratio=0.75`.
+- Added granular logging for `coord_loss` (x, y, z) and `energy_loss` (e) to better understand reconstruction performance.
+- Observed `val_loss` of ~0.0008 and strong negative correlation (-0.69) between density and MAE.
+
 ## [Iteration 8]
 - Switched to `neighborhood=False` (random global sampling) to increase task difficulty and learn global dependencies.
 - Increased `num_hits` from 256 to 512 to provide more context for global sampling.
