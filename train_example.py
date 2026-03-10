@@ -184,6 +184,42 @@ def compute_all_hit_representations(model, hits, window_size=256, overlap=128):
     final_coords = torch.cat(all_coords, dim=0)
     return final_latents, final_coords
 
+def compute_collapse_metrics(masked_preds, decoded, mask):
+    """
+    Compute metrics to detect mode collapse in reconstruction and latents.
+    masked_preds: (N_masked, K, D) - reconstructed patches
+    decoded: (B, G, D_dec) - decoder output tokens
+    mask: (B, G) - binary mask
+    """
+    metrics = {}
+    
+    # 1. Prediction Variance across different patches (Mode Collapse in output)
+    # Mean of each patch: (N_masked, D)
+    patch_means = masked_preds.mean(dim=1)
+    # Variance across patches for each feature, then mean over features
+    metrics["var_across_patches"] = patch_means.var(dim=0).mean().item()
+    
+    # 2. Prediction Variance within each patch (Structural collapse)
+    metrics["var_within_patches"] = masked_preds.var(dim=1).mean().item()
+    
+    # 3. Latent Cosine Similarity (Mode Collapse in latents)
+    mask_bool = mask.bool()
+    decoded_masked = decoded[mask_bool] # (N_masked, D_dec)
+    if len(decoded_masked) > 1:
+        # Sample if too many to avoid O(N^2) memory
+        if len(decoded_masked) > 512:
+            indices = torch.randperm(len(decoded_masked))[:512]
+            decoded_masked = decoded_masked[indices]
+            
+        decoded_norm = nn.functional.normalize(decoded_masked, p=2, dim=1)
+        cos_sim = torch.mm(decoded_norm, decoded_norm.t())
+        avg_cos_sim = (cos_sim.sum() - len(cos_sim)) / (len(cos_sim) * (len(cos_sim) - 1))
+        metrics["latent_cos_sim"] = avg_cos_sim.item()
+    else:
+        metrics["latent_cos_sim"] = 1.0
+        
+    return metrics
+
 def compute_representation_metrics(all_embeddings, all_hits, epoch, output_dir):
     """
     Compute PCA, Clustering, and Correlation metrics to evaluate representation expressiveness.
@@ -245,7 +281,7 @@ def plot_metrics_history(history, output_dir):
     """
     epochs = [h["epoch"] for h in history]
     
-    fig, axs = plt.subplots(2, 2, figsize=(15, 12))
+    fig, axs = plt.subplots(3, 2, figsize=(15, 18))
     
     axs[0, 0].plot(epochs, [h["train_loss"] for h in history], marker='o', label='Train Loss')
     axs[0, 0].plot(epochs, [h["val_loss"] for h in history], marker='o', label='Val Loss')
@@ -265,6 +301,19 @@ def plot_metrics_history(history, output_dir):
         corrs = [h["density_corr"] for h in history if "density_corr" in h]
         axs[1, 1].plot(epochs[:len(corrs)], corrs, marker='o', color='purple')
         axs[1, 1].set_title("Density vs Loss Correlation")
+
+    # Mode Collapse Monitoring
+    if "var_across_patches" in history[0]:
+        axs[2, 0].plot(epochs, [h["var_across_patches"] for h in history], marker='o', color='orange', label='Var Across Patches')
+        axs[2, 0].plot(epochs, [h["var_within_patches"] for h in history], marker='s', color='brown', label='Var Within Patches')
+        axs[2, 0].set_title("Prediction Variance (higher is better)")
+        axs[2, 0].set_yscale('log')
+        axs[2, 0].legend()
+
+    if "latent_cos_sim" in history[0]:
+        axs[2, 1].plot(epochs, [h["latent_cos_sim"] for h in history], marker='o', color='cyan')
+        axs[2, 1].set_title("Latent Cosine Similarity (lower is better)")
+        axs[2, 1].set_ylim(0, 1.05)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "representation_metrics_evolution.png"))
@@ -362,9 +411,13 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
             # Use pre-computed indices to extract targets
             target_pts = index_points(full_targets, group_idx)
             
+            # Use local coordinates for display
+            target_pts_local = target_pts.clone()
+            target_pts_local[:, :, :, :3] = target_pts[:, :, :, :3] - centers.unsqueeze(2)
+            
             # target_pts is (B, G, K, D)
             # reconstructed is (B, G, K, D)
-            hits_np = target_pts[0].cpu().numpy() # (G, K, D)
+            hits_np = target_pts_local[0].cpu().numpy() # (G, K, D)
             recon_np = reconstructed[0].cpu().numpy() # (G, K, D)
             mask_np = mask[0].cpu().numpy().astype(bool) # (G,)
             
@@ -401,6 +454,7 @@ class MaskedPointModel(nn.Module):
         
         # --- Encoder ---
         self.patch_embed = PatchEmbed(n_patches=n_patches, k=k, in_chans=5, embed_dim=embed_dim)
+        # Use learned absolute pos_embed as fallback/additional signal
         self.pos_embed = nn.Parameter(torch.randn(1, n_patches, embed_dim) * 0.02)
         
         encoder_layer = nn.TransformerEncoderLayer(
@@ -413,7 +467,12 @@ class MaskedPointModel(nn.Module):
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.randn(decoder_embed_dim))
         
-        self.decoder_pos_embed = nn.Parameter(torch.randn(1, n_patches, decoder_embed_dim) * 0.02)
+        # Spatial Positional Embedding for Decoder (Crucial for masked patches!)
+        self.decoder_pos_mlp = nn.Sequential(
+            nn.Linear(3, decoder_embed_dim),
+            nn.ReLU(),
+            nn.Linear(decoder_embed_dim, decoder_embed_dim)
+        )
         
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=decoder_embed_dim, nhead=nhead // 2, batch_first=True, 
@@ -458,7 +517,7 @@ class MaskedPointModel(nn.Module):
         # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
-        return x_masked, mask, ids_restore
+        return x_masked, mask, ids_restore, ids_keep
 
     def forward(self, hits, mask_ratio=0.5):
         # 1. Embedding and Tokenization
@@ -469,27 +528,31 @@ class MaskedPointModel(nn.Module):
         x = x + self.pos_embed[:, :x.shape[1], :]
         
         # Masking (masking tokens, which represent patches)
-        x_visible, mask, ids_restore = self.random_masking(x, mask_ratio)
+        x_visible, mask, ids_restore, ids_keep = self.random_masking(x, mask_ratio)
         
         # Heavy encoding
-        if os.environ.get("DEBUG") == "1":
-            print(f"Encoder input shape: {x_visible.shape}")
         latent_visible = self.encoder(x_visible)
         
         # 2. Decoder (visible + mask tokens)
         x_dec = self.decoder_embed(latent_visible)
-        mask_tokens = self.mask_token.repeat(x_dec.shape[0], ids_restore.shape[1] - x_dec.shape[1], 1)
+        
+        # Create full sequence for decoder
+        B, G, D = x_dec.shape
+        L = centers.shape[1]
+        
+        # mask_tokens: (B, L - G, D)
+        mask_tokens = self.mask_token.repeat(B, L - G, 1)
         x_full = torch.cat([x_dec, mask_tokens], dim=1) 
         
         # Unshuffle to original positions
         x_full = torch.gather(x_full, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_dec.shape[2]))
         
-        # Add decoder positional embeddings
-        x_full = x_full + self.decoder_pos_embed[:, :x_full.shape[1], :]
+        # Add spatial positional embeddings to ALL tokens in decoder
+        # This is where the model learns WHERE each patch is
+        spatial_pos = self.decoder_pos_mlp(centers)
+        x_full = x_full + spatial_pos
         
         # Light decoding
-        if os.environ.get("DEBUG") == "1":
-            print(f"Decoder input shape: {x_full.shape}")
         decoded = self.decoder(x_full)
         
         # Reconstruct
@@ -600,23 +663,38 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             
             # 3. Use pre-computed indices to extract targets (Zero Redundancy)
             target_pts = index_points(full_targets, group_idx)
+            
+            # --- Local Reconstruction Target ---
+            # Subtract centers from target XYZ
+            # target_pts: (B, G, K, D), centers: (B, G, 3)
+            target_pts_local = target_pts.clone()
+            target_pts_local[:, :, :, :3] = target_pts[:, :, :, :3] - centers.unsqueeze(2)
 
             # Extract masked targets and preds
             mask_bool = mask.bool()
-            masked_targets = target_pts[mask_bool]
+            masked_targets = target_pts_local[mask_bool]
             masked_preds = reconstructed[mask_bool]
             
             # Energy-weighted loss
-            weights = masked_targets[:, :, 3]
+            weights = target_pts[mask_bool][:, :, 3] # Use original energy for weighting
             loss_raw = nn.SmoothL1Loss(reduction='none')(masked_preds, masked_targets).mean(dim=-1)
-            loss = (loss_raw * weights).mean()
+            recon_loss = (loss_raw * weights).mean()
+            
+            # 4. Variance Loss (Explicit Diversity)
+            # Penalize low variance across patches to prevent mode collapse
+            # patch_means: (N_masked, D)
+            patch_means = masked_preds.mean(dim=1)
+            var_across = patch_means.var(dim=0).mean()
+            var_loss = 1.0 / (var_across + 1e-6)
+            
+            loss = recon_loss + 0.01 * var_loss
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
             total_train_loss += loss.item()
-            pbar.set_postfix(loss=loss.item())
+            pbar.set_postfix(loss=loss.item(), var=var_across.item())
 
         scheduler.step()
         num_batches = i + 1
@@ -630,6 +708,9 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         
         val_embeddings_sample = []
         val_hits_sample = []
+        
+        # Accumulate collapse metrics
+        collapse_metrics_list = []
         
         with torch.no_grad():
             v_batches = 0
@@ -646,13 +727,23 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 
                 # Extract target patches
                 target_pts = index_points(full_targets, group_idx)
+                
+                # Use local coordinates for loss calculation
+                target_pts_local = target_pts.clone()
+                target_pts_local[:, :, :, :3] = target_pts[:, :, :, :3] - centers.unsqueeze(2)
 
                 if v_batches <= 10:
                     val_embeddings_sample.append(latent.cpu().numpy().reshape(-1, latent.shape[-1]))
                     val_hits_sample.append(centers.cpu().numpy().reshape(-1, 3))
+                    
+                    # Compute collapse metrics for a subset of batches
+                    mask_bool = mask.bool()
+                    m_preds = reconstructed[mask_bool]
+                    c_metrics = compute_collapse_metrics(m_preds, latent, mask)
+                    collapse_metrics_list.append(c_metrics)
 
                 mask_bool = mask.bool()
-                m_targets = target_pts[mask_bool]
+                m_targets = target_pts_local[mask_bool]
                 m_preds = reconstructed[mask_bool]
                 
                 loss = nn.SmoothL1Loss()(m_preds, m_targets)
@@ -677,6 +768,10 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             "train_loss": avg_train_loss,
             "val_loss": avg_val_loss,
         }
+
+        if collapse_metrics_list:
+            avg_collapse = {k: np.mean([m[k] for m in collapse_metrics_list]) for k in collapse_metrics_list[0].keys()}
+            epoch_stats.update(avg_collapse)
 
         if val_embeddings_sample:
             all_emb = np.concatenate(val_embeddings_sample, axis=0)
