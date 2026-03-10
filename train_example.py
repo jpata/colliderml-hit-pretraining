@@ -364,7 +364,7 @@ class PointNetEncoder(nn.Module):
 
 class MaskedPointModel(nn.Module):
     def __init__(self, embed_dim=128, decoder_embed_dim=64, nhead=8, 
-                 encoder_layers=6, decoder_layers=2, max_len=1024, output_dim=11):
+                 encoder_layers=6, decoder_layers=4, max_len=1024, output_dim=11):
         super().__init__()
         
         # --- Encoder ---
@@ -388,8 +388,16 @@ class MaskedPointModel(nn.Module):
         )
         self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_layers)
         
-        # Reconstruction head
-        self.reconstructor = nn.Linear(decoder_embed_dim, output_dim)
+        # Reconstruction head: Multi-layer MLP for better spatial 'unfolding'
+        self.reconstructor = nn.Sequential(
+            nn.Linear(decoder_embed_dim, decoder_embed_dim),
+            nn.LayerNorm(decoder_embed_dim),
+            nn.ReLU(),
+            nn.Linear(decoder_embed_dim, decoder_embed_dim),
+            nn.LayerNorm(decoder_embed_dim),
+            nn.ReLU(),
+            nn.Linear(decoder_embed_dim, output_dim)
+        )
 
     def random_masking(self, x, mask_ratio):
         """

@@ -44,6 +44,7 @@ class CalorimeterDataset(IterableDataset):
         self.num_hits = num_hits
         self.max_events = max_events
         self.chunk_size = chunk_size
+        self.epoch = 0
         
         # Identify shards dynamically from cache
         cache_root = Path("~/.cache/colliderml").expanduser()
@@ -114,8 +115,17 @@ class CalorimeterDataset(IterableDataset):
             
         return events
 
+    def set_epoch(self, epoch):
+        """Used to update the epoch for randomization across epochs."""
+        self.epoch = epoch
+
     def __iter__(self):
         worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        
+        # Use SeedSequence to ensure unique, robust streams across workers/epochs
+        ss = np.random.SeedSequence([self.epoch, worker_id])
+        
         if worker_info is None:
             calo_shards = self.calo_shards
             tracker_shards = self.tracker_shards
@@ -164,7 +174,10 @@ class CalorimeterDataset(IterableDataset):
                 for raw_hits in raw_events:
                     if max_events is not None and events_yielded >= max_events:
                         return
-                    processed = self._finalize_event(raw_hits, events_yielded)
+                    
+                    # Generate an independent RNG for this event
+                    event_rng = np.random.default_rng(ss.spawn(1)[0])
+                    processed = self._finalize_event(raw_hits, event_rng)
                     yield processed
                     events_yielded += 1
 
@@ -176,9 +189,8 @@ class CalorimeterDataset(IterableDataset):
         sort_idx = np.argsort(indices)
         return hits[sort_idx]
 
-    def _finalize_event(self, hits, event_idx):
+    def _finalize_event(self, hits, rng):
         n_hits = hits.shape[0]
-        rng = np.random.default_rng(seed=event_idx)
         
         if n_hits >= self.num_hits:
             indices = rng.choice(n_hits, self.num_hits, replace=False)
@@ -217,9 +229,8 @@ class CalorimeterDataset(IterableDataset):
         }
 
 class NeighborhoodCalorimeterDataset(CalorimeterDataset):
-    def _finalize_event(self, hits, event_idx):
+    def _finalize_event(self, hits, rng):
         n_hits = hits.shape[0]
-        rng = np.random.default_rng(seed=event_idx)
 
         if n_hits <= self.num_hits:
             padding = np.zeros((self.num_hits - n_hits, 5), dtype=np.float32)
