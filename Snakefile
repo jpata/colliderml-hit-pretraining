@@ -1,4 +1,4 @@
-DATASET_SIZES = [100, 500, 1000, 2000, 5000]
+DATASET_SIZES = [100, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]
 NUM_HITS = 256
 EMBED_DIM = 32
 NEIGHBORHOOD = "True"
@@ -35,14 +35,23 @@ rule aggregate:
         "scan_results_snakemake.csv"
     run:
         import os
-        with open(output[0], "w") as out:
-            out.write("max_events,loss,neighborhood\n")
-            for s in DATASET_SIZES:
-                loss_file = f"results/s{s}/loss.txt"
-                if os.path.exists(loss_file):
-                    with open(loss_file) as f:
-                        loss = f.read().strip()
-                    out.write(f"{s},{loss},{NEIGHBORHOOD}\n")
+        import pandas as pd
+        rows = []
+        for s in DATASET_SIZES:
+            loss_file = f"results/s{s}/loss.txt"
+            if os.path.exists(loss_file):
+                df = pd.read_csv(loss_file)
+                if not df.empty:
+                    final_val_loss = df.iloc[-1]["val_loss"]
+                    rows.append({
+                        "max_events": s, 
+                        "loss": final_val_loss, 
+                        "neighborhood": NEIGHBORHOOD,
+                        "num_hits": NUM_HITS,
+                        "embed_dim": EMBED_DIM
+                    })
+        
+        pd.DataFrame(rows).to_csv(output[0], index=False)
 
 rule visualize:
     input:
