@@ -39,7 +39,7 @@ class CalorimeterDataset(IterableDataset):
             
         return np.stack(features, axis=1)
 
-    def __init__(self, num_hits=2048, max_events=None, verbose=False, chunk_size=20):
+    def __init__(self, num_hits=2048, max_events=None, verbose=False, chunk_size=200):
         self.verbose = verbose
         self.num_hits = num_hits
         self.max_events = max_events
@@ -76,42 +76,58 @@ class CalorimeterDataset(IterableDataset):
 
     def _process_chunk(self, calo_df, tracker_df=None):
         """Processes a chunk of events into a list of hit arrays with hit type flag."""
+        n_events = calo_df.height
+        
+        # Calo: (x, y, z, e)
+        # Use explode() + to_numpy() for vectorized processing
+        c_x = calo_df["x"].list.explode().to_numpy().astype(np.float32) / self.coord_scale
+        c_y = calo_df["y"].list.explode().to_numpy().astype(np.float32) / self.coord_scale
+        c_z = calo_df["z"].list.explode().to_numpy().astype(np.float32) / self.coord_scale
+        c_e = np.log10(calo_df["total_energy"].list.explode().to_numpy().astype(np.float32) / 1e-6 + 1.0)
+        c_counts = calo_df["x"].list.len().to_numpy()
+        
+        # Tracker: (x, y, z)
+        if tracker_df is not None:
+            t_x = tracker_df["x"].list.explode().to_numpy().astype(np.float32) / self.coord_scale
+            t_y = tracker_df["y"].list.explode().to_numpy().astype(np.float32) / self.coord_scale
+            t_z = tracker_df["z"].list.explode().to_numpy().astype(np.float32) / self.coord_scale
+            t_counts = tracker_df["x"].list.len().to_numpy()
+        else:
+            t_counts = np.zeros(n_events, dtype=np.int64)
+
         events = []
-        
-        # Calo columns
-        c_x_lists = calo_df["x"].to_list()
-        c_y_lists = calo_df["y"].to_list()
-        c_z_lists = calo_df["z"].to_list()
-        c_e_lists = calo_df["total_energy"].to_list()
-        
-        # Tracker columns
-        t_x_lists = tracker_df["x"].to_list() if tracker_df is not None else [[] for _ in range(len(c_x_lists))]
-        t_y_lists = tracker_df["y"].to_list() if tracker_df is not None else [[] for _ in range(len(c_x_lists))]
-        t_z_lists = tracker_df["z"].to_list() if tracker_df is not None else [[] for _ in range(len(c_x_lists))]
-        
-        for i in range(len(c_x_lists)):
+        c_offset = 0
+        t_offset = 0
+        for i in range(n_events):
+            cc = c_counts[i]
+            tc = t_counts[i]
+            
             # Calorimeter Hits (Type 0)
-            cx = np.array(c_x_lists[i], dtype=np.float32) / self.coord_scale
-            cy = np.array(c_y_lists[i], dtype=np.float32) / self.coord_scale
-            cz = np.array(c_z_lists[i], dtype=np.float32) / self.coord_scale
-            ce = np.log10(np.array(c_e_lists[i], dtype=np.float32) / 1e-6 + 1.0)
-            ctype = np.zeros_like(cx)
+            cx = c_x[c_offset : c_offset + cc]
+            cy = c_y[c_offset : c_offset + cc]
+            cz = c_z[c_offset : c_offset + cc]
+            ce = c_e[c_offset : c_offset + cc]
+            ct = np.zeros(cc, dtype=np.float32)
             
             # Tracker Hits (Type 1)
-            tx = np.array(t_x_lists[i], dtype=np.float32) / self.coord_scale
-            ty = np.array(t_y_lists[i], dtype=np.float32) / self.coord_scale
-            tz = np.array(t_z_lists[i], dtype=np.float32) / self.coord_scale
-            te = np.full_like(tx, self.tracker_energy_const)
-            ttype = np.ones_like(tx)
-            
-            # Combine all hits: (N, 5) -> (x, y, z, e, type)
-            x = np.concatenate([cx, tx])
-            y = np.concatenate([cy, ty])
-            z = np.concatenate([cz, tz])
-            e = np.concatenate([ce, te])
-            h_type = np.concatenate([ctype, ttype])
+            if tc > 0:
+                tx = t_x[t_offset : t_offset + tc]
+                ty = t_y[t_offset : t_offset + tc]
+                tz = t_z[t_offset : t_offset + tc]
+                te = np.full(tc, self.tracker_energy_const, dtype=np.float32)
+                tt = np.ones(tc, dtype=np.float32)
+                
+                x = np.concatenate([cx, tx])
+                y = np.concatenate([cy, ty])
+                z = np.concatenate([cz, tz])
+                e = np.concatenate([ce, te])
+                h_type = np.concatenate([ct, tt])
+            else:
+                x, y, z, e, h_type = cx, cy, cz, ce, ct
             
             events.append(np.stack([x, y, z, e, h_type], axis=1))
+            c_offset += cc
+            t_offset += tc
             
         return events
 

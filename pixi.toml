@@ -5,10 +5,13 @@ name = "pytorch-train"
 platforms = ["linux-64"]
 version = "0.1.0"
 
+[activation.env]
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+
 [tasks]
-train = "LD_LIBRARY_PATH=$PIXI_PROJECT_ROOT/.pixi/envs/default/lib python train_example.py --output_loss loss.csv --mask_ratio 0.75 --lr 2e-4 --num_hits 512 --epochs 100 --max_events 10000"
-scan = "LD_LIBRARY_PATH=$PIXI_PROJECT_ROOT/.pixi/envs/default/lib python scan_params.py"
-snakemake = "LD_LIBRARY_PATH=$PIXI_PROJECT_ROOT/.pixi/envs/default/lib snakemake"
+train = "python train_example.py"
+scan = "python scan_params.py"
+snakemake = "snakemake"
 
 [dependencies]
 python = "*"
