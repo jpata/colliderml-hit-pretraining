@@ -270,6 +270,37 @@ def plot_metrics_history(history, output_dir):
     plt.savefig(os.path.join(output_dir, "representation_metrics_evolution.png"))
     plt.close()
 
+def plot_fidelity_vs_density(density_stats, epoch, output_dir):
+    """
+    Plot reconstruction fidelity (loss) vs local energy density.
+    density_stats: list of (energy_density, loss) tuples.
+    """
+    density_stats = np.array(density_stats)
+    if len(density_stats) == 0: return
+    
+    densities = density_stats[:, 0]
+    losses = density_stats[:, 1]
+    
+    # Filter out invalid values for log-log visualization
+    # Note: densities from compute_density are already log10(sum + 1)
+    mask = (densities > 0) & (losses > 0)
+    densities = densities[mask]
+    losses = losses[mask]
+    
+    if len(densities) < 10: return
+
+    plt.figure(figsize=(10, 8))
+    # hexbin naturally handles density of points for better visualization than scatter
+    hb = plt.hexbin(densities, np.log10(losses), gridsize=50, cmap='viridis', bins='log')
+    plt.colorbar(hb, label='log10(count)')
+    plt.xlabel('Local Energy Density (log10(sum E + 1))')
+    plt.ylabel('Reconstruction Loss (log10(MAE))')
+    plt.title(f'Reconstruction Fidelity vs Energy Density - Epoch {epoch+1}')
+    
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+    plt.savefig(os.path.join(output_dir, f"fidelity_vs_density_epoch_{epoch+1}.png"))
+    plt.close()
+
 def visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=1):
     model.eval()
     device = next(model.parameters()).device
@@ -341,18 +372,22 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
             ax1 = fig.add_subplot(121, projection='3d')
             ax2 = fig.add_subplot(122, projection='3d')
             
+            cmap = plt.get_cmap('tab20')
             for g in range(hits_np.shape[0]):
                 p_hits = hits_np[g]
                 p_recon = recon_np[g]
+                color = cmap(g % 20)
                 if mask_np[g]:
-                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], c='red', s=20, marker='x', alpha=0.6)
-                    ax2.scatter(p_recon[:, 0], p_recon[:, 1], p_recon[:, 2], c='green', s=20, marker='o', alpha=0.6)
+                    # Masked patches: 'x' for Ground Truth, 'o' for Reconstruction
+                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], color=color, s=30, marker='x', alpha=0.8)
+                    ax2.scatter(p_recon[:, 0], p_recon[:, 1], p_recon[:, 2], color=color, s=30, marker='o', alpha=0.8)
                 else:
-                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], c='blue', s=10, alpha=0.3)
-                    ax2.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], c='blue', s=10, alpha=0.3)
+                    # Visible patches: '.' for both
+                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], color=color, s=15, marker='.', alpha=0.3)
+                    ax2.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], color=color, s=15, marker='.', alpha=0.3)
             
-            ax1.set_title("Ground Truth (Red=Masked)")
-            ax2.set_title("Reconstruction (Green=Pred)")
+            ax1.set_title("Ground Truth (x=Masked, .=Visible)")
+            ax2.set_title("Reconstruction (o=Pred, .=Visible)")
             plt.savefig(os.path.join(output_dir, f"reconstruction_epoch_{epoch+1}_ev{i}.png"))
             plt.close()
 
@@ -624,12 +659,13 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 total_val_loss += loss.item()
                 
                 # Density analysis
-                # Column 5-7 are densities in target_pts (B, G, K, D)
-                m_densities = target_pts[:, :, :, 5:8].mean(dim=-1).mean(dim=-1)[mask_bool]
+                # Column 5-7 are count densities, 8-10 are energy densities (log10(sum E + 1))
+                m_energy_densities = target_pts[:, :, :, 8:11].mean(dim=-1).mean(dim=-1)[mask_bool]
                 
+                # Reconstruction fidelity (MAE on first 5 hit features)
                 hit_losses = torch.mean(torch.abs(m_targets[:, :, :5] - m_preds[:, :, :5]), dim=(1, 2))
                 
-                for d, l in zip(m_densities.cpu().numpy().flatten(), hit_losses.cpu().numpy().flatten()):
+                for d, l in zip(m_energy_densities.cpu().numpy().flatten(), hit_losses.cpu().numpy().flatten()):
                     density_stats.append((float(d), float(l)))
         
         avg_val_loss = total_val_loss / v_batches
@@ -651,10 +687,13 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             epoch_stats.update(rep_metrics)
 
         if density_stats:
+            # Plot fidelity vs energy density at every epoch
+            plot_fidelity_vs_density(density_stats, epoch, output_dir)
+            
             density_stats = np.array(density_stats)
             valid_mask = (density_stats[:, 0] > 0) & (density_stats[:, 1] > 0)
             if np.any(valid_mask):
-                log_density = np.log10(density_stats[valid_mask, 0])
+                log_density = density_stats[valid_mask, 0] # Already log10 from compute_density
                 log_loss = np.log10(density_stats[valid_mask, 1])
                 corr = np.corrcoef(log_density, log_loss)[0, 1]
                 epoch_stats["density_corr"] = corr
