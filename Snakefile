@@ -14,6 +14,12 @@ rule train:
         model = "results/s{max_events}/checkpoint.pth"
     params:
         output_dir = "results/s{max_events}"
+    resources:
+        slurm_partition="gpu",
+        gres="gpu:l40:1",
+        mem_mb=24000,
+        runtime=120,
+        cpus_per_task=8
     shell:
         """
         python scripts/train_example.py \
@@ -33,6 +39,9 @@ rule aggregate:
         expand("results/s{max_events}/loss.txt", max_events=DATASET_SIZES)
     output:
         "scan_results_snakemake.csv"
+    resources:
+        mem_mb=4000,
+        runtime=10
     run:
         import os
         import pandas as pd
@@ -58,6 +67,9 @@ rule visualize:
         "scan_results_snakemake.csv"
     output:
         "loss_scaling.png"
+    resources:
+        mem_mb=4000,
+        runtime=10
     shell:
         """
         python scripts/visualize_scan.py

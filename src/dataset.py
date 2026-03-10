@@ -49,7 +49,7 @@ class CalorimeterDataset(IterableDataset):
         self.epoch = 0
         
         # Identify shards dynamically from cache
-        cache_root = Path("~/.cache/colliderml").expanduser()
+        cache_root = Path(os.getenv("COLLIDERML_DATA_DIR", "~/.cache/colliderml")).expanduser()
         release_root = cache_root / "CERN__ColliderML-Release-1"
         
         calo_name = f"{dataset_name}_pu0_calo_hits"

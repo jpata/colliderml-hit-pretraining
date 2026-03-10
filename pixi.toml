@@ -7,13 +7,50 @@ version = "0.1.0"
 
 [activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
-COLLIDERML_DATA_DIR = "data"
+COLLIDERML_DATA_DIR = "/scratch/persistent/joosep/colliderml"
 PYTHONPATH = "$PIXI_PROJECT_ROOT/src:$PYTHONPATH"
+
+[feature.tallinn.activation]
+env = { SITE = "tallinn", PROFILE = ".profiles/tallinn", CORES = "1" }
+
+[feature.local.activation]
+env = { SITE = "local", PROFILE = ".profiles/local", CORES = "1" }
+
+[feature.tallinn.tasks]
+init = """
+mkdir -p .profiles/tallinn \
+&& echo '#!/bin/bash
+# properties = {properties}
+{exec_job}' > .profiles/tallinn/jobscript.sh \
+&& echo 'executor: "slurm"
+jobscript: "jobscript.sh"
+jobs: unlimited
+restart-times: 0
+max-jobs-per-second: 1
+jobs: 1
+max-status-checks-per-second: 1
+verbose: true
+use-conda: false
+default-resources:
+  - slurm_account="hepusers"' > .profiles/tallinn/config.v8+.yaml
+"""
+
+[feature.local.tasks]
+init = """
+mkdir -p .profiles/local \
+&& echo 'executor: "local"
+jobs: 1
+restart-times: 0
+local-cores: 1
+verbose: false' > .profiles/local/config.v8+.yaml
+"""
 
 [tasks]
 train = "python scripts/train_example.py"
 scan = "python scripts/scan_params.py"
 snakemake = "snakemake"
+run-snakemake = "snakemake --workflow-profile $PROFILE --cores $CORES"
+dry-run = "snakemake --dry-run"
 download-ttbar = "colliderml download --channels ttbar --pileup pu0 --objects particles,tracker_hits,calo_hits,tracks --max-events 10000"
 download-ggf = "colliderml download --channels ggf --pileup pu0 --objects particles,tracker_hits,calo_hits,tracks --max-events 10000"
 download = { depends-on = ["download-ttbar", "download-ggf"] }
@@ -23,6 +60,10 @@ python = "*"
 libstdcxx-ng = "*"
 umap-learn = ">=0.5.11,<0.6"
 setuptools = "==81.0.0"
+snakemake = ">=8.0"
+snakemake-executor-plugin-slurm = "*"
+snakemake-executor-plugin-cluster-generic = "*"
+pyyaml = "*"
 
 [pypi-dependencies]
 colliderml = "*"
@@ -33,9 +74,13 @@ pandas = "*"
 tqdm = "*"
 matplotlib = "*"
 seaborn = "*"
-snakemake = "*"
 torch = "*"
 torchvision = "*"
 torchaudio = "*"
 tensorboard = ">=2.20.0"
 setuptools = "==81.0.0"
+
+[environments]
+tallinn = ["tallinn"]
+local = ["local"]
+default = ["tallinn"]

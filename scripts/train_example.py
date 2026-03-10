@@ -723,8 +723,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
-        num_workers=14, 
-        prefetch_factor=2,
+        num_workers=4, 
+        prefetch_factor=4,
         pin_memory=True
     )
     val_dataloader = DataLoader(
@@ -988,7 +988,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_patches", type=int, default=128)
     parser.add_argument("--k_neighbors", type=int, default=64)
     parser.add_argument("--train_dataset", type=str, default="ttbar")
-    parser.add_argument("--val_dataset", type=str, default="ggf")
+    parser.add_argument("--val_dataset", type=str, default="ttbar")
     args = parser.parse_args()
     
     use_neighborhood = args.neighborhood == "True"

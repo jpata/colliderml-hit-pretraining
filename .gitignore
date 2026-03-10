@@ -1,11 +1,12 @@
-# pixi environments
 .pixi/*
 !.pixi/config.toml
 *.pth
 pixi.lock
-.snakemake/**
+
 __pycache__/**
 **/__pycache__
 results/
-results_iteration_*/
 validation_plots/*.png
+
+.snakemake/**
+.profiles
