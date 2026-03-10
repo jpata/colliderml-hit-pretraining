@@ -13,7 +13,11 @@ To effectively learn the local and global physics of particle showers, we use a 
 
 ## Optimized Preprocessing
 
-To avoid GPU idling during data loading, the project uses an `IterableDataset` with worker-aware partitioning. This offloads shard loading and event-level processing to **background CPU workers** via the PyTorch `DataLoader`. Geometric tokenization (FPS/KNN) and multi-scale density computation are performed on the **GPU** during the model's forward pass to leverage parallel hardware.
+To avoid GPU idling during data loading, the project uses an `IterableDataset` with worker-aware partitioning. This offloads shard loading and event-level processing to **background CPU workers**. 
+
+Key optimizations include:
+*   **Spatial Sorting:** Hits are sorted using a **Morton (Z-order) curve** (implemented in `hilbert.py`) during dataset finalization to ensure spatial locality, improving cache efficiency for the Transformer.
+*   **GPU-Accelerated Tokenization:** Geometric tokenization (FPS/KNN) and multi-scale density computation are performed on the **GPU** during the model's forward pass to leverage parallel hardware.
 
 ## Quantitative Validation: Fidelity vs. Density
 
@@ -24,6 +28,7 @@ We evaluate the model's ability to use context through **Density-Conditioned Rec
 ## Project Structure
 
 *   `dataset.py`: Multi-scale feature computation and spatially-aware sampling (`NeighborhoodCalorimeterDataset`).
+*   `hilbert.py`: Vectorized Morton/Hilbert indexing for spatial data sorting.
 *   `train_example.py`: Main training script with hierarchical patching and GPU-accelerated tokenization.
 *   `compute_all_representations.py`: Sliding-window inference for full-event embedding.
 *   `visualize_scan.py`: Analysis of hyperparameter scans.
@@ -69,5 +74,4 @@ pixi run python compute_all_representations.py \
 
 *   **`reconstruction_epoch_{N}_ev{idx}.png`**: Side-by-side comparison of true hits (red=masked) vs model predictions (green).
 *   **`point_cloud_epoch_{N}_ev{idx}.png`**: 3D visualization of hits colored by their DBSCAN clustering in the latent space.
-*   **`representation_metrics_evolution.png`**: Tracking of PCA entropy, silhouette scores, and density correlations over time.
-*   **`fidelity_vs_density_epoch_{N}.png`**: Heatmap showing how reconstruction accuracy scales with local hit density.
+*   **`representation_metrics_evolution.png`**: Tracking of PCA entropy, silhouette scores, and density-loss correlations over training epochs.
