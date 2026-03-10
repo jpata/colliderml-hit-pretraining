@@ -8,10 +8,11 @@ version = "0.1.0"
 [activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 COLLIDERML_DATA_DIR = "data"
+PYTHONPATH = "$PIXI_PROJECT_ROOT/src:$PYTHONPATH"
 
 [tasks]
-train = "python train_example.py"
-scan = "python scan_params.py"
+train = "python scripts/train_example.py"
+scan = "python scripts/scan_params.py"
 snakemake = "snakemake"
 download-ttbar = "colliderml download --channels ttbar --pileup pu0 --objects particles,tracker_hits,calo_hits,tracks --max-events 10000"
 download-ggf = "colliderml download --channels ggf --pileup pu0 --objects particles,tracker_hits,calo_hits,tracks --max-events 10000"

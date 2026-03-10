@@ -1,7 +1,7 @@
-NUM_HITS = [128, 256]
-EMBED_DIMS = [16, 32]
-DATASET_SIZES = [100, 500]
-NEIGHBORHOOD = ["True", "False"]
+DATASET_SIZES = [100, 500, 1000, 2000, 5000]
+NUM_HITS = 256
+EMBED_DIM = 32
+NEIGHBORHOOD = "True"
 
 rule all:
     input:
@@ -10,19 +10,18 @@ rule all:
 
 rule train:
     output:
-        loss = "results/h{num_hits}_e{embed_dim}_s{max_events}_n{neighborhood}/loss.txt",
-        model = "results/h{num_hits}_e{embed_dim}_s{max_events}_n{neighborhood}/checkpoint_h{num_hits}_e{embed_dim}_neigh{neighborhood}.pth"
+        loss = "results/s{max_events}/loss.txt",
+        model = "results/s{max_events}/checkpoint.pth"
     params:
-        output_dir = "results/h{num_hits}_e{embed_dim}_s{max_events}_n{neighborhood}"
+        output_dir = "results/s{max_events}"
     shell:
         """
-        LD_LIBRARY_PATH=$PIXI_PROJECT_ROOT/.pixi/envs/default/lib \
-        python train_example.py \
-            --num_hits {wildcards.num_hits} \
-            --embed_dim {wildcards.embed_dim} \
+        python scripts/train_example.py \
+            --num_hits {NUM_HITS} \
+            --embed_dim {EMBED_DIM} \
             --max_events {wildcards.max_events} \
-            --neighborhood {wildcards.neighborhood} \
-            --epochs 5 \
+            --neighborhood {NEIGHBORHOOD} \
+            --epochs 2 \
             --batch_size 16 \
             --output_dir {params.output_dir} \
             --output_loss loss.txt
@@ -30,21 +29,19 @@ rule train:
 
 rule aggregate:
     input:
-        expand("results/h{num_hits}_e{embed_dim}_s{max_events}_n{neighborhood}/loss.txt", 
-               num_hits=NUM_HITS, embed_dim=EMBED_DIMS, max_events=DATASET_SIZES, neighborhood=NEIGHBORHOOD)
+        expand("results/s{max_events}/loss.txt", max_events=DATASET_SIZES)
     output:
         "scan_results_snakemake.csv"
     run:
+        import os
         with open(output[0], "w") as out:
-            out.write("num_hits,embed_dim,max_events,neighborhood,loss\n")
-            for h in NUM_HITS:
-                for e in EMBED_DIMS:
-                    for s in DATASET_SIZES:
-                        for n in NEIGHBORHOOD:
-                            loss_file = f"results/h{h}_e{e}_s{s}_n{n}/loss.txt"
-                            with open(loss_file) as f:
-                                loss = f.read().strip()
-                            out.write(f"{h},{e},{s},{n},{loss}\n")
+            out.write("max_events,loss,neighborhood\n")
+            for s in DATASET_SIZES:
+                loss_file = f"results/s{s}/loss.txt"
+                if os.path.exists(loss_file):
+                    with open(loss_file) as f:
+                        loss = f.read().strip()
+                    out.write(f"{s},{loss},{NEIGHBORHOOD}\n")
 
 rule visualize:
     input:
@@ -53,6 +50,5 @@ rule visualize:
         "loss_scaling.png"
     shell:
         """
-        LD_LIBRARY_PATH=$PIXI_PROJECT_ROOT/.pixi/envs/default/lib \
-        python visualize_scan.py
+        python scripts/visualize_scan.py
         """

@@ -695,7 +695,7 @@ def compute_density(hits, radii=[0.01, 0.02, 0.05], return_all=False):
     return torch.stack(density_features, dim=-1).mean(dim=-1)
 
 def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4, 
-          output_dir="results", output_loss=None, use_neighborhood=True, 
+          output_dir="results", output_loss=None, output_checkpoint=None, use_neighborhood=True, 
           mask_ratio=0.5, lr=1e-4, n_patches=64, k_neighbors=32,
           train_dataset_name="ttbar", val_dataset_name="ggf"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
