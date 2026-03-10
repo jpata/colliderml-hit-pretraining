@@ -40,18 +40,23 @@ class CalorimeterDataset(IterableDataset):
             
         return np.stack(features, axis=1)
 
-    def __init__(self, num_hits=2048, max_events=None, verbose=False, chunk_size=200):
+    def __init__(self, dataset_name="ttbar", num_hits=2048, max_events=None, skip_events=0, verbose=False, chunk_size=200):
         self.verbose = verbose
         self.num_hits = num_hits
         self.max_events = max_events
+        self.skip_events = skip_events
         self.chunk_size = chunk_size
         self.epoch = 0
         
         # Identify shards dynamically from cache
         cache_root = Path("~/.cache/colliderml").expanduser()
         release_root = cache_root / "CERN__ColliderML-Release-1"
-        self.calo_dir = release_root / "ttbar_pu0_calo_hits/data/ttbar_pu0_calo_hits"
-        self.tracker_dir = release_root / "ttbar_pu0_tracker_hits/data/ttbar_pu0_tracker_hits"
+        
+        calo_name = f"{dataset_name}_pu0_calo_hits"
+        tracker_name = f"{dataset_name}_pu0_tracker_hits"
+        
+        self.calo_dir = release_root / calo_name / "data" / calo_name
+        self.tracker_dir = release_root / tracker_name / "data" / tracker_name
         
         if not self.calo_dir.exists():
             raise FileNotFoundError(f"Calo shard directory {self.calo_dir} not found.")
@@ -70,7 +75,7 @@ class CalorimeterDataset(IterableDataset):
         self.required_cols_tracker = ["x", "y", "z"]
 
     def __len__(self):
-        total = len(self.calo_shards) * self.rows_per_shard
+        total = len(self.calo_shards) * self.rows_per_shard - self.skip_events
         if self.max_events is not None:
             return min(self.max_events, total)
         return total
@@ -139,51 +144,62 @@ class CalorimeterDataset(IterableDataset):
     def __iter__(self):
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
         
         # Use SeedSequence to ensure unique, robust streams across workers/epochs
         ss = np.random.SeedSequence([self.epoch, worker_id])
         
-        if worker_info is None:
-            calo_shards = self.calo_shards
-            tracker_shards = self.tracker_shards
-            max_events = self.max_events
+        # Determine global max_events per worker
+        if self.max_events is not None:
+            max_events = self.max_events // num_workers
+            if worker_id < self.max_events % num_workers:
+                max_events += 1
         else:
-            # Partition shards among workers
-            idx = worker_info.id
-            num_workers = worker_info.num_workers
-            calo_shards = self.calo_shards[idx::num_workers]
-            tracker_shards = self.tracker_shards[idx::num_workers] if self.tracker_shards else []
-            
-            if self.max_events is not None:
-                max_events = self.max_events // num_workers
-                if idx < self.max_events % num_workers:
-                    max_events += 1
-            else:
-                max_events = None
-            
+            max_events = None
+
+        # Partition shards among workers
+        shard_indices = list(range(worker_id, len(self.calo_shards), num_workers))
+        
         events_yielded = 0
         
-        for i, calo_path in enumerate(calo_shards):
-            tracker_path = tracker_shards[i] if tracker_shards else None
+        for s_idx in shard_indices:
+            calo_path = self.calo_shards[s_idx]
+            tracker_path = self.tracker_shards[s_idx] if self.tracker_shards else None
+            
+            # Global index bounds for this shard
+            shard_global_start = s_idx * self.rows_per_shard
+            shard_global_end = (s_idx + 1) * self.rows_per_shard
+            
+            # Skip if this shard is entirely before the skip threshold
+            if shard_global_end <= self.skip_events:
+                continue
+            
+            # Where to start within this shard
+            start_within_shard = max(0, self.skip_events - shard_global_start)
             
             if self.verbose:
-                print(f"Worker {os.getpid()} processing calo shard {calo_path.name}")
+                print(f"Worker {worker_id} processing calo shard {calo_path.name}, skipping {start_within_shard} events.")
             
             l_calo = pl.scan_parquet(calo_path, low_memory=True)
             l_tracker = pl.scan_parquet(tracker_path, low_memory=True) if tracker_path else None
             
-            for start in range(0, self.rows_per_shard, self.chunk_size):
-                if max_events is not None and events_yielded >= max_events:
-                    return
+            for chunk_start in range(0, self.rows_per_shard, self.chunk_size):
+                chunk_end = chunk_start + self.chunk_size
                 
-                num_to_load = min(self.chunk_size, self.rows_per_shard - start)
+                # Entire chunk skipped
+                if chunk_end <= start_within_shard:
+                    continue
+                
+                # Slice logic within shard
+                slice_start = max(chunk_start, start_within_shard)
+                slice_len = min(self.chunk_size, chunk_end - slice_start)
                 
                 try:
-                    c_chunk = l_calo.slice(start, num_to_load).collect()
-                    t_chunk = l_tracker.slice(start, num_to_load).collect() if l_tracker is not None else None
+                    c_chunk = l_calo.slice(slice_start, slice_len).collect()
+                    t_chunk = l_tracker.slice(slice_start, slice_len).collect() if l_tracker is not None else None
                 except Exception as e:
                     if self.verbose:
-                        print(f"Error reading chunk: {e}")
+                        print(f"Error reading chunk in shard {s_idx}: {e}")
                     break
                 
                 raw_events = self._process_chunk(c_chunk, t_chunk)

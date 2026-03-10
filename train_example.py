@@ -696,25 +696,29 @@ def compute_density(hits, radii=[0.01, 0.02, 0.05], return_all=False):
 
 def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4, 
           output_dir="results", output_loss=None, use_neighborhood=True, 
-          mask_ratio=0.5, lr=1e-4, n_patches=64, k_neighbors=32):
+          mask_ratio=0.5, lr=1e-4, n_patches=64, k_neighbors=32,
+          train_dataset_name="ttbar", val_dataset_name="ggf"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Config: num_hits={num_hits}, embed_dim={embed_dim}, patches={n_patches}x{k_neighbors}, mask_ratio={mask_ratio}, lr={lr}")
+    print(f"Datasets: train={train_dataset_name}, val={val_dataset_name}")
     
     os.makedirs(output_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=output_dir)
     
     # Initialize/Clear metrics log
     with open(os.path.join(output_dir, "metrics.log"), "w") as f:
-        f.write(f"Training session started. Config: hits={num_hits}, embed={embed_dim}, ratio={mask_ratio}\n\n")
+        f.write(f"Training session started. Config: hits={num_hits}, embed={embed_dim}, ratio={mask_ratio}\n")
+        f.write(f"Datasets: train={train_dataset_name}, val={val_dataset_name}\n\n")
 
     # Dataset Selection
+    val_size = 500
     if use_neighborhood:
-        train_dataset = NeighborhoodCalorimeterDataset(num_hits=num_hits, max_events=max_events, verbose=False)
-        val_dataset = NeighborhoodCalorimeterDataset(num_hits=num_hits, max_events=100, verbose=False)
+        train_dataset = NeighborhoodCalorimeterDataset(dataset_name=train_dataset_name, num_hits=num_hits, max_events=max_events, skip_events=0, verbose=False)
+        val_dataset = NeighborhoodCalorimeterDataset(dataset_name=val_dataset_name, num_hits=num_hits, max_events=val_size, skip_events=0, verbose=False)
     else:
-        train_dataset = CalorimeterDataset(num_hits=num_hits, max_events=max_events, verbose=False)
-        val_dataset = CalorimeterDataset(num_hits=num_hits, max_events=100, verbose=False)
+        train_dataset = CalorimeterDataset(dataset_name=train_dataset_name, num_hits=num_hits, max_events=max_events, skip_events=0, verbose=False)
+        val_dataset = CalorimeterDataset(dataset_name=val_dataset_name, num_hits=num_hits, max_events=val_size, skip_events=0, verbose=False)
     
     train_dataloader = DataLoader(
         train_dataset, 
@@ -981,6 +985,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--n_patches", type=int, default=128)
     parser.add_argument("--k_neighbors", type=int, default=64)
+    parser.add_argument("--train_dataset", type=str, default="ttbar")
+    parser.add_argument("--val_dataset", type=str, default="ggf")
     args = parser.parse_args()
     
     use_neighborhood = args.neighborhood == "True"
@@ -997,5 +1003,7 @@ if __name__ == "__main__":
         mask_ratio=args.mask_ratio,
         lr=args.lr,
         n_patches=args.n_patches,
-        k_neighbors=args.k_neighbors
+        k_neighbors=args.k_neighbors,
+        train_dataset_name=args.train_dataset,
+        val_dataset_name=args.val_dataset
     )
