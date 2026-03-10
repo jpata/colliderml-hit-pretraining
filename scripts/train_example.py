@@ -21,7 +21,26 @@ from scipy.stats import entropy
 import seaborn as sns
 import os
 import json
+import threading
+import time
+import subprocess
 from torch.utils.tensorboard import SummaryWriter
+
+def log_cpu_usage(interval=30):
+    """
+    Periodically prints the CPU usage of the current process using the 'top' command.
+    """
+    pid = os.getpid()
+    while True:
+        try:
+            # Run top in batch mode for a single iteration for the current PID
+            result = subprocess.run(['top', '-b', '-n', '1', '-p', str(pid)], capture_output=True, text=True)
+            for line in result.stdout.splitlines():
+                if str(pid) in line:
+                    print(f"\n[MONITOR] CPU/MEM usage for PID {pid}: {line.strip()}")
+        except Exception as e:
+            print(f"\n[MONITOR] Error monitoring CPU: {e}")
+        time.sleep(interval)
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -394,10 +413,12 @@ def plot_fidelity_vs_density(density_stats, epoch, output_dir, writer=None):
     plt.close()
 
 def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, writer=None):
+    print(f"  - Starting visualize_embeddings for {n_events} events")
     model.eval()
     device = next(model.parameters()).device
 
     for i in range(min(n_events, len(full_dataset))):
+        print(f"    - Processing event {i}")
         event_data = full_dataset.get_full_event(i)
         all_hits_np = event_data["all_hits"]
         all_hits = torch.from_numpy(all_hits_np).to(device)
@@ -405,10 +426,12 @@ def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, wri
         if all_hits.shape[0] < 10: continue
         
         # Compute embeddings
+        print(f"    - Computing representations for event {i}")
         embeddings, coords = compute_all_hit_representations(model, all_hits, window_size=256)
         embeddings_np = embeddings.numpy()
         coords_np = coords.numpy()
         
+        print(f"    - Running DBSCAN for event {i}")
         clustering = DBSCAN(eps=0.5, min_samples=3).fit(embeddings_np)
         clusters = clustering.labels_
         
@@ -430,6 +453,7 @@ def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, wri
         ax.set_title(f'Event {event_data["event_id"]} - Epoch {epoch+1}\n(DBSCAN on Patches)')
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
+        print(f"    - Saving point cloud plot for event {i}")
         plt.savefig(os.path.join(output_dir, f"point_cloud_epoch_{epoch+1}_ev{i}.png"))
         if writer:
             writer.add_figure(f"Embeddings/Event {i}", fig, global_step=epoch)
@@ -440,12 +464,14 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
     """
     Visualize ground truth vs model reconstruction for a few events.
     """
+    print(f"  - Starting visualize_reconstruction for {n_events} events")
     model.eval()
     device = next(model.parameters()).device
     
     with torch.no_grad():
         for i, batch_hits in enumerate(dataloader):
             if i >= n_events: break
+            print(f"    - Processing batch {i} for reconstruction")
             
             batch_hits = batch_hits.to(device, non_blocking=True)
             
@@ -492,10 +518,12 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
             ax2.set_title("Reconstruction (x=Pred, .=Visible)")
             ax2.set_xlabel('Local X')
             ax2.set_ylabel('Local Y')
+            print(f"    - Saving reconstruction plot for batch {i}")
             plt.savefig(os.path.join(output_dir, f"reconstruction_epoch_{epoch+1}_ev{i}.png"))
             if writer:
                 writer.add_figure(f"Reconstruction/Event {i}", fig, global_step=epoch)
             plt.close()
+
 
 def compute_chamfer_loss(preds, targets, return_components=False):
     """
@@ -700,6 +728,11 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
           train_dataset_name="ttbar", val_dataset_name="ggf"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    
+    # Start the monitoring thread
+    monitor_thread = threading.Thread(target=log_cpu_usage, args=(30,), daemon=True)
+    monitor_thread.start()
+    
     print(f"Config: num_hits={num_hits}, embed_dim={embed_dim}, patches={n_patches}x{k_neighbors}, mask_ratio={mask_ratio}, lr={lr}")
     print(f"Datasets: train={train_dataset_name}, val={val_dataset_name}")
     
@@ -730,7 +763,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     val_dataloader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
-        num_workers=4,
+        num_workers=0,
         pin_memory=True
     )
     
@@ -843,6 +876,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         print(f"Epoch {epoch+1} Average Train Loss: {avg_train_loss:.6f}")
 
         # Validation phase
+        print(f"Starting Validation Epoch {epoch+1}...")
         model.eval()
         total_val_loss = 0
         density_stats = [] 
@@ -855,7 +889,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         
         with torch.no_grad():
             v_batches = 0
-            for batch_hits in val_dataloader:
+            val_pbar = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{epochs} [Val]")
+            for batch_hits in val_pbar:
                 v_batches += 1
                 batch_hits = batch_hits.to(device, non_blocking=True)
                 
@@ -903,11 +938,13 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 
                 for d, l in zip(m_energy_densities.cpu().numpy().flatten(), hit_losses.cpu().numpy().flatten()):
                     density_stats.append((float(d), float(l)))
+                
+                val_pbar.set_postfix(loss=loss.item())
         
         avg_val_loss = total_val_loss / v_batches
         print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.6f}")
 
-        
+        print(f"Computing epoch statistics...")
         epoch_stats = {
             "epoch": epoch + 1,
             "train_loss": avg_train_loss,
@@ -915,10 +952,12 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         }
 
         if collapse_metrics_list:
+            print(f"Averaging collapse metrics...")
             avg_collapse = {k: np.mean([m[k] for m in collapse_metrics_list]) for k in collapse_metrics_list[0].keys()}
             epoch_stats.update(avg_collapse)
 
         if val_embeddings_sample:
+            print(f"Computing representation metrics...")
             all_emb = np.concatenate(val_embeddings_sample, axis=0)
             all_hits_pos = np.concatenate(val_hits_sample, axis=0)
             all_hits_padded = np.zeros((all_hits_pos.shape[0], 5))
@@ -927,6 +966,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             epoch_stats.update(rep_metrics)
 
         if density_stats:
+            print(f"Computing density correlation...")
             density_stats = np.array(density_stats)
             valid_mask = (density_stats[:, 0] > 0) & (density_stats[:, 1] > 0)
             if np.any(valid_mask):
@@ -945,16 +985,23 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             f.write("\n\n")
 
         # Log all epoch stats to TensorBoard
+        print(f"Logging to TensorBoard...")
         for k, v in epoch_stats.items():
             if isinstance(v, (int, float, np.float32, np.float64)):
                 writer.add_scalar(f"Epoch/{k}", v, epoch)
 
+        print(f"Plotting metrics history...")
         plot_metrics_history(metrics_history, output_dir, writer=writer)
         epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss, 0, 0)) 
 
+        print(f"Visualizing embeddings...")
         visualize_embeddings(model, train_dataset, epoch, output_dir, n_events=1, writer=writer)
+        print(f"Visualizing reconstruction...")
         visualize_reconstruction(model, val_dataloader, epoch, output_dir, n_events=2, mask_ratio=curr_mask_ratio, writer=writer)
+        print(f"Plotting fidelity vs density...")
         plot_fidelity_vs_density(density_stats, epoch, output_dir, writer=writer)
+        writer.flush()
+
 
     # Save model
     ckpt_name = output_checkpoint if output_checkpoint else f"checkpoint_h{num_hits}_patches.pth"

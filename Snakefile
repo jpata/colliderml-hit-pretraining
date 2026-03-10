@@ -17,7 +17,7 @@ rule train:
     resources:
         slurm_partition="gpu",
         gres="gpu:l40:1",
-        mem_mb=24000,
+        mem_mb=20000,
         runtime=120,
         cpus_per_task=8
     shell:
