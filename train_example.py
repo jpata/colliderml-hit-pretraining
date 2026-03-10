@@ -20,6 +20,18 @@ from sklearn.decomposition import PCA
 from scipy.stats import entropy
 import seaborn as sns
 import os
+import json
+from torch.utils.tensorboard import SummaryWriter
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
 
 def square_distance(src, dst):
     """
@@ -290,7 +302,7 @@ def compute_representation_metrics(all_embeddings, all_hits, epoch, output_dir):
         
     return metrics
 
-def plot_metrics_history(history, output_dir):
+def plot_metrics_history(history, output_dir, writer=None):
     """
     Plot the evolution of representation metrics over epochs.
     """
@@ -344,9 +356,11 @@ def plot_metrics_history(history, output_dir):
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "representation_metrics_evolution.png"))
+    if writer:
+        writer.add_figure("Summary/Metrics History", fig, global_step=epochs[-1])
     plt.close()
 
-def plot_fidelity_vs_density(density_stats, epoch, output_dir):
+def plot_fidelity_vs_density(density_stats, epoch, output_dir, writer=None):
     """
     Plot reconstruction fidelity (loss) vs local energy density.
     density_stats: list of (energy_density, loss) tuples.
@@ -365,7 +379,7 @@ def plot_fidelity_vs_density(density_stats, epoch, output_dir):
     
     if len(densities) < 10: return
 
-    plt.figure(figsize=(10, 8))
+    fig = plt.figure(figsize=(10, 8))
     # hexbin naturally handles density of points for better visualization than scatter
     hb = plt.hexbin(densities, np.log10(losses), gridsize=50, cmap='viridis', bins='log')
     plt.colorbar(hb, label='log10(count)')
@@ -375,9 +389,11 @@ def plot_fidelity_vs_density(density_stats, epoch, output_dir):
     
     plt.grid(True, which="both", ls="-", alpha=0.2)
     plt.savefig(os.path.join(output_dir, f"fidelity_vs_density_epoch_{epoch+1}.png"))
+    if writer:
+        writer.add_figure(f"Validation/Fidelity vs Density", fig, global_step=epoch)
     plt.close()
 
-def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1):
+def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, writer=None):
     model.eval()
     device = next(model.parameters()).device
 
@@ -415,10 +431,12 @@ def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1):
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         plt.savefig(os.path.join(output_dir, f"point_cloud_epoch_{epoch+1}_ev{i}.png"))
+        if writer:
+            writer.add_figure(f"Embeddings/Event {i}", fig, global_step=epoch)
         plt.close()
 
 
-def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, mask_ratio=0.5):
+def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, mask_ratio=0.5, writer=None):
     """
     Visualize ground truth vs model reconstruction for a few events.
     """
@@ -475,6 +493,8 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
             ax2.set_xlabel('Local X')
             ax2.set_ylabel('Local Y')
             plt.savefig(os.path.join(output_dir, f"reconstruction_epoch_{epoch+1}_ev{i}.png"))
+            if writer:
+                writer.add_figure(f"Reconstruction/Event {i}", fig, global_step=epoch)
             plt.close()
 
 def compute_chamfer_loss(preds, targets, return_components=False):
@@ -682,6 +702,11 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     print(f"Config: num_hits={num_hits}, embed_dim={embed_dim}, patches={n_patches}x{k_neighbors}, mask_ratio={mask_ratio}, lr={lr}")
     
     os.makedirs(output_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=output_dir)
+    
+    # Initialize/Clear metrics log
+    with open(os.path.join(output_dir, "metrics.log"), "w") as f:
+        f.write(f"Training session started. Config: hits={num_hits}, embed={embed_dim}, ratio={mask_ratio}\n\n")
 
     # Dataset Selection
     if use_neighborhood:
@@ -798,6 +823,9 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             optimizer.step()
             
             total_train_loss += loss.item()
+            writer.add_scalar("Batch/Loss", loss.item(), epoch * len(train_dataloader) + i)
+            writer.add_scalar("Batch/Chamfer", chamfer_loss.item(), epoch * len(train_dataloader) + i)
+            
             pbar.set_postfix(
                 loss=loss.item(), 
                 chamfer=chamfer_loss.item(), 
@@ -895,9 +923,6 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             epoch_stats.update(rep_metrics)
 
         if density_stats:
-            # Plot fidelity vs energy density at every epoch
-            plot_fidelity_vs_density(density_stats, epoch, output_dir)
-            
             density_stats = np.array(density_stats)
             valid_mask = (density_stats[:, 0] > 0) & (density_stats[:, 1] > 0)
             if np.any(valid_mask):
@@ -907,16 +932,31 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 epoch_stats["density_corr"] = corr
 
         metrics_history.append(epoch_stats)
-        plot_metrics_history(metrics_history, output_dir)
+        
+        # Save metrics to a text log for LLM analysis
+        log_file_path = os.path.join(output_dir, "metrics.log")
+        with open(log_file_path, "a") as f:
+            f.write(f"--- Epoch {epoch+1} ---\n")
+            f.write(json.dumps(epoch_stats, indent=2, cls=NumpyEncoder))
+            f.write("\n\n")
+
+        # Log all epoch stats to TensorBoard
+        for k, v in epoch_stats.items():
+            if isinstance(v, (int, float, np.float32, np.float64)):
+                writer.add_scalar(f"Epoch/{k}", v, epoch)
+
+        plot_metrics_history(metrics_history, output_dir, writer=writer)
         epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss, 0, 0)) 
 
-        visualize_embeddings(model, train_dataset, epoch, output_dir, n_events=1)
-        visualize_reconstruction(model, val_dataloader, epoch, output_dir, n_events=2, mask_ratio=curr_mask_ratio)
+        visualize_embeddings(model, train_dataset, epoch, output_dir, n_events=1, writer=writer)
+        visualize_reconstruction(model, val_dataloader, epoch, output_dir, n_events=2, mask_ratio=curr_mask_ratio, writer=writer)
+        plot_fidelity_vs_density(density_stats, epoch, output_dir, writer=writer)
 
     # Save model
     save_path = os.path.join(output_dir, f"checkpoint_h{num_hits}_patches.pth")
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
+    writer.close()
 
     if output_loss:
         loss_file_path = os.path.join(output_dir, output_loss)

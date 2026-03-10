@@ -31,7 +31,7 @@ We evaluate the model's ability to use context through **Density-Conditioned Rec
 *   `hilbert.py`: Vectorized Morton/Hilbert indexing for spatial data sorting.
 *   `train_example.py`: Main training script with hierarchical patching and GPU-accelerated tokenization.
 *   `compute_all_representations.py`: Sliding-window inference for full-event embedding.
-*   `visualize_scan.py`: Analysis of hyperparameter scans.
+*   `check_consistency.py`: Script to verify dataset integrity.
 
 ## Installation & Requirements
 
@@ -54,10 +54,11 @@ Train with default patch-level tokenization and neighborhood sampling:
 ```bash
 pixi run python train_example.py \
     --neighborhood True \
-    --n_patches 64 \
-    --k_neighbors 32 \
-    --num_hits 1024 \
+    --n_patches 128 \
+    --k_neighbors 64 \
+    --num_hits 2048 \
     --epochs 20 \
+    --batch_size 64 \
     --output_dir results/patch_experiment
 ```
 
@@ -65,8 +66,8 @@ pixi run python train_example.py \
 
 ```bash
 pixi run python compute_all_representations.py \
-    --checkpoint results/patch_experiment/checkpoint_h1024_patches.pth \
-    --num_hits 1024 \
+    --checkpoint results/patch_experiment/checkpoint_h2048_patches.pth \
+    --num_hits 2048 \
     --embed_dim 128
 ```
 

@@ -17,6 +17,7 @@ snakemake = "snakemake"
 python = "*"
 libstdcxx-ng = "*"
 umap-learn = ">=0.5.11,<0.6"
+setuptools = "==81.0.0"
 
 [pypi-dependencies]
 colliderml = "*"
@@ -31,3 +32,5 @@ snakemake = "*"
 torch = "*"
 torchvision = "*"
 torchaudio = "*"
+tensorboard = ">=2.20.0"
+setuptools = "==81.0.0"
