@@ -184,12 +184,13 @@ def compute_all_hit_representations(model, hits, window_size=256, overlap=128):
     final_coords = torch.cat(all_coords, dim=0)
     return final_latents, final_coords
 
-def compute_collapse_metrics(masked_preds, decoded, mask):
+def compute_collapse_metrics(masked_preds, decoded, mask, targets=None):
     """
     Compute metrics to detect mode collapse in reconstruction and latents.
     masked_preds: (N_masked, K, D) - reconstructed patches
     decoded: (B, G, D_dec) - decoder output tokens
     mask: (B, G) - binary mask
+    targets: (N_masked, K, D) - ground truth patches
     """
     metrics = {}
     
@@ -201,8 +202,22 @@ def compute_collapse_metrics(masked_preds, decoded, mask):
     
     # 2. Prediction Variance within each patch (Structural collapse)
     metrics["var_within_patches"] = masked_preds.var(dim=1).mean().item()
+
+    # 3. Average Nearest Neighbor Distance (within patch)
+    # If points are on top of each other, this will be close to 0
+    p_xyz = masked_preds[:, :, :3]
+    dist_self = torch.cdist(p_xyz, p_xyz)
+    # Get 2nd smallest distance (1st is 0 to self)
+    nn_dist = dist_self.topk(2, dim=-1, largest=False)[0][:, :, 1]
+    metrics["avg_nn_dist"] = nn_dist.mean().item()
+
+    # 4. Chamfer Precision and Recall
+    if targets is not None:
+        _, precision, recall = compute_chamfer_loss(masked_preds, targets, return_components=True)
+        metrics["chamfer_precision"] = precision.item()
+        metrics["chamfer_recall"] = recall.item()
     
-    # 3. Latent Cosine Similarity (Mode Collapse in latents)
+    # 5. Latent Cosine Similarity (Mode Collapse in latents)
     mask_bool = mask.bool()
     decoded_masked = decoded[mask_bool] # (N_masked, D_dec)
     if len(decoded_masked) > 1:
@@ -281,7 +296,7 @@ def plot_metrics_history(history, output_dir):
     """
     epochs = [h["epoch"] for h in history]
     
-    fig, axs = plt.subplots(3, 2, figsize=(15, 18))
+    fig, axs = plt.subplots(4, 2, figsize=(15, 24))
     
     axs[0, 0].plot(epochs, [h["train_loss"] for h in history], marker='o', label='Train Loss')
     axs[0, 0].plot(epochs, [h["val_loss"] for h in history], marker='o', label='Val Loss')
@@ -314,6 +329,18 @@ def plot_metrics_history(history, output_dir):
         axs[2, 1].plot(epochs, [h["latent_cos_sim"] for h in history], marker='o', color='cyan')
         axs[2, 1].set_title("Latent Cosine Similarity (lower is better)")
         axs[2, 1].set_ylim(0, 1.05)
+
+    if "avg_nn_dist" in history[0]:
+        axs[3, 0].plot(epochs, [h["avg_nn_dist"] for h in history], marker='o', color='magenta')
+        axs[3, 0].set_title("Avg Nearest Neighbor Dist (higher is better)")
+        axs[3, 0].set_yscale('log')
+
+    if "chamfer_precision" in history[0]:
+        axs[3, 1].plot(epochs, [h["chamfer_precision"] for h in history], marker='o', label='Precision (Acc)')
+        axs[3, 1].plot(epochs, [h["chamfer_recall"] for h in history], marker='s', label='Recall (Comp)')
+        axs[3, 1].set_title("Chamfer Accuracy vs Completeness")
+        axs[3, 1].set_yscale('log')
+        axs[3, 1].legend()
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "representation_metrics_evolution.png"))
@@ -450,7 +477,7 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
             plt.savefig(os.path.join(output_dir, f"reconstruction_epoch_{epoch+1}_ev{i}.png"))
             plt.close()
 
-def compute_chamfer_loss(preds, targets):
+def compute_chamfer_loss(preds, targets, return_components=False):
     """
     Computes Chamfer Distance between predicted and target patches.
     preds: (N, K, D), targets: (N, K, D)
@@ -462,11 +489,13 @@ def compute_chamfer_loss(preds, targets):
     # (N, K, K)
     dist = torch.cdist(p_xyz, t_xyz)
     
-    # Distance from each pred to nearest target
+    # Precision: distance from each pred to nearest target
     min_dist_p = dist.min(dim=2)[0].mean(dim=1)
-    # Distance from each target to nearest pred
+    # Recall: distance from each target to nearest pred
     min_dist_t = dist.min(dim=1)[0].mean(dim=1)
     
+    if return_components:
+        return (min_dist_p + min_dist_t).mean(), min_dist_p.mean(), min_dist_t.mean()
     return (min_dist_p + min_dist_t).mean()
 
 class MaskedPointModel(nn.Module):
@@ -819,7 +848,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                     # Compute collapse metrics for a subset of batches
                     mask_bool = mask.bool()
                     m_preds = reconstructed[mask_bool]
-                    c_metrics = compute_collapse_metrics(m_preds, latent, mask)
+                    m_targets = target_pts_local[mask_bool]
+                    c_metrics = compute_collapse_metrics(m_preds, latent, mask, targets=m_targets)
                     collapse_metrics_list.append(c_metrics)
 
                 mask_bool = mask.bool()
