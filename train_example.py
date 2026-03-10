@@ -350,7 +350,7 @@ def plot_fidelity_vs_density(density_stats, epoch, output_dir):
     plt.savefig(os.path.join(output_dir, f"fidelity_vs_density_epoch_{epoch+1}.png"))
     plt.close()
 
-def visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=1):
+def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1):
     model.eval()
     device = next(model.parameters()).device
 
@@ -370,7 +370,7 @@ def visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=1):
         clusters = clustering.labels_
         
         fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection='3d')
+        ax = fig.add_subplot(111)
         
         cmap = plt.get_cmap('tab20')
         def get_colors(lbls):
@@ -381,10 +381,12 @@ def visualize_embeddings_3d(model, full_dataset, epoch, output_dir, n_events=1):
             return cols
 
         # Plot hits colored by cluster of their corresponding embedding
-        ax.scatter(coords_np[:, 0], coords_np[:, 1], coords_np[:, 2],
-                  c=get_colors(clusters), marker='o', s=20, alpha=0.8)
+        ax.scatter(coords_np[:, 0], coords_np[:, 1],
+                  c=get_colors(clusters), marker='o', s=20)
             
         ax.set_title(f'Event {event_data["event_id"]} - Epoch {epoch+1}\n(DBSCAN on Patches)')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
         plt.savefig(os.path.join(output_dir, f"point_cloud_epoch_{epoch+1}_ev{i}.png"))
         plt.close()
 
@@ -422,8 +424,8 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
             mask_np = mask[0].cpu().numpy().astype(bool) # (G,)
             
             fig = plt.figure(figsize=(16, 8))
-            ax1 = fig.add_subplot(121, projection='3d')
-            ax2 = fig.add_subplot(122, projection='3d')
+            ax1 = fig.add_subplot(121)
+            ax2 = fig.add_subplot(122)
             
             cmap = plt.get_cmap('tab20')
             for g in range(hits_np.shape[0]):
@@ -431,18 +433,41 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
                 p_recon = recon_np[g]
                 color = cmap(g % 20)
                 if mask_np[g]:
-                    # Masked patches: 'x' for Ground Truth, 'o' for Reconstruction
-                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], color=color, s=30, marker='x', alpha=0.8)
-                    ax2.scatter(p_recon[:, 0], p_recon[:, 1], p_recon[:, 2], color=color, s=30, marker='o', alpha=0.8)
+                    # Masked patches: 'x' for Ground Truth, 'x' for Reconstruction
+                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], color=color, s=30, marker='x')
+                    ax2.scatter(p_recon[:, 0], p_recon[:, 1], color=color, s=30, marker='x')
                 else:
                     # Visible patches: '.' for both
-                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], color=color, s=15, marker='.', alpha=0.3)
-                    ax2.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], color=color, s=15, marker='.', alpha=0.3)
+                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], color=color, s=15, marker='.')
+                    ax2.scatter(p_hits[:, 0], p_hits[:, 1], color=color, s=15, marker='.')
             
             ax1.set_title("Ground Truth (x=Masked, .=Visible)")
-            ax2.set_title("Reconstruction (o=Pred, .=Visible)")
+            ax1.set_xlabel('Local X')
+            ax1.set_ylabel('Local Y')
+            ax2.set_title("Reconstruction (x=Pred, .=Visible)")
+            ax2.set_xlabel('Local X')
+            ax2.set_ylabel('Local Y')
             plt.savefig(os.path.join(output_dir, f"reconstruction_epoch_{epoch+1}_ev{i}.png"))
             plt.close()
+
+def compute_chamfer_loss(preds, targets):
+    """
+    Computes Chamfer Distance between predicted and target patches.
+    preds: (N, K, D), targets: (N, K, D)
+    """
+    # Just for the first 3 coordinates for shape diversity
+    p_xyz = preds[:, :, :3]
+    t_xyz = targets[:, :, :3]
+    
+    # (N, K, K)
+    dist = torch.cdist(p_xyz, t_xyz)
+    
+    # Distance from each pred to nearest target
+    min_dist_p = dist.min(dim=2)[0].mean(dim=1)
+    # Distance from each target to nearest pred
+    min_dist_t = dist.min(dim=1)[0].mean(dim=1)
+    
+    return (min_dist_p + min_dist_t).mean()
 
 class MaskedPointModel(nn.Module):
     def __init__(self, embed_dim=128, decoder_embed_dim=64, nhead=8, 
@@ -464,33 +489,42 @@ class MaskedPointModel(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=encoder_layers)
         
         # --- Decoder ---
-        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
+        # Decoder will take concatenated (latent + spatial_pos)
+        # So decoder_input_dim = decoder_embed_dim + decoder_pos_dim
+        self.decoder_pos_dim = 32
+        self.decoder_embed_dim = decoder_embed_dim
+        
+        self.decoder_proj = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.randn(decoder_embed_dim))
         
-        # Spatial Positional Embedding for Decoder (Crucial for masked patches!)
         self.decoder_pos_mlp = nn.Sequential(
-            nn.Linear(3, decoder_embed_dim),
+            nn.Linear(3, self.decoder_pos_dim),
             nn.ReLU(),
-            nn.Linear(decoder_embed_dim, decoder_embed_dim)
+            nn.Linear(self.decoder_pos_dim, self.decoder_pos_dim)
         )
         
+        decoder_total_dim = decoder_embed_dim + self.decoder_pos_dim
         decoder_layer = nn.TransformerEncoderLayer(
-            d_model=decoder_embed_dim, nhead=nhead // 2, batch_first=True, 
+            d_model=decoder_total_dim, nhead=nhead // 2, batch_first=True, 
             activation='relu', norm_first=True
         )
         self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_layers)
         
-        # Reconstruction head: 
-        # Reconstruct K points per token (total: K * output_dim)
-        recon_output_dim = output_dim * k
+        # Folding Seed for diversity within patches
+        # Each point in a patch has its own learnable seed
+        self.folding_seed = nn.Parameter(torch.randn(1, k, 16))
+        # Spatial grid prior (3D) to provide a geometric baseline
+        self.register_buffer('spatial_grid', torch.randn(1, k, 3))
+        
+        # Reconstruction head: Processes each point separately
         self.reconstructor = nn.Sequential(
-            nn.Linear(decoder_embed_dim, decoder_embed_dim),
-            nn.LayerNorm(decoder_embed_dim),
-            nn.ReLU(),
-            nn.Linear(decoder_embed_dim, decoder_embed_dim),
-            nn.LayerNorm(decoder_embed_dim),
-            nn.ReLU(),
-            nn.Linear(decoder_embed_dim, recon_output_dim)
+            nn.Linear(decoder_total_dim + 16 + 3, decoder_total_dim),
+            nn.LayerNorm(decoder_total_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(decoder_total_dim, decoder_total_dim),
+            nn.LayerNorm(decoder_total_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(decoder_total_dim, output_dim)
         )
 
     def random_masking(self, x, mask_ratio):
@@ -533,34 +567,46 @@ class MaskedPointModel(nn.Module):
         # Heavy encoding
         latent_visible = self.encoder(x_visible)
         
-        # 2. Decoder (visible + mask tokens)
-        x_dec = self.decoder_embed(latent_visible)
+        # 2. Decoder
+        x_dec = self.decoder_proj(latent_visible)
         
-        # Create full sequence for decoder
-        B, G, D = x_dec.shape
+        B, G_vis, D_dec = x_dec.shape
         L = centers.shape[1]
         
-        # mask_tokens: (B, L - G, D)
-        mask_tokens = self.mask_token.repeat(B, L - G, 1)
+        # mask_tokens: (B, L - G_vis, D_dec)
+        mask_tokens = self.mask_token.repeat(B, L - G_vis, 1)
         x_full = torch.cat([x_dec, mask_tokens], dim=1) 
         
         # Unshuffle to original positions
-        x_full = torch.gather(x_full, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_dec.shape[2]))
+        x_full = torch.gather(x_full, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D_dec))
         
-        # Add spatial positional embeddings to ALL tokens in decoder
-        # This is where the model learns WHERE each patch is
+        # Concatenate spatial positional embeddings
         spatial_pos = self.decoder_pos_mlp(centers)
-        x_full = x_full + spatial_pos
+        x_full = torch.cat([x_full, spatial_pos], dim=-1) # (B, L, D_dec + D_pos)
         
         # Light decoding
         decoded = self.decoder(x_full)
         
-        # Reconstruct
-        reconstructed = self.reconstructor(decoded)
+        # 3. Folding Reconstruction
+        B, L, D_total = decoded.shape
+        # seed: (1, K, 16) -> (B, L, K, 16)
+        seed = self.folding_seed.view(1, 1, self.k, 16).expand(B, L, self.k, 16)
+        # spatial_grid: (1, K, 3) -> (B, L, K, 3)
+        grid = self.spatial_grid.view(1, 1, self.k, 3).expand(B, L, self.k, 3)
         
-        # Reshape reconstructed (B, G, K*output_dim) to (B, G, K, output_dim)
-        B, G, _ = reconstructed.shape
-        reconstructed = reconstructed.view(B, G, self.k, self.output_dim)
+        # Add stochastic noise during training to force the MLP to use the seed
+        if self.training:
+            noise = torch.randn_like(seed) * 0.1
+            seed = seed + noise
+            grid = grid + torch.randn_like(grid) * 0.05
+
+        # decoded: (B, L, D_total) -> (B, L, K, D_total)
+        decoded_expanded = decoded.unsqueeze(2).expand(B, L, self.k, D_total)
+        
+        combined = torch.cat([decoded_expanded, seed, grid], dim=-1) # (B, L, K, D_total + 16 + 3)
+        
+        reconstructed = self.reconstructor(combined.reshape(-1, D_total + 16 + 3))
+        reconstructed = reconstructed.view(B, L, self.k, self.output_dim)
             
         return reconstructed, mask, decoded, centers, group_idx
 
@@ -659,7 +705,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             full_targets = torch.cat([batch_hits, aux_targets], dim=-1)
             
             # 2. Forward pass returns patches/centers computed during tokenization
-            reconstructed, mask, _, centers, group_idx = model(batch_hits, mask_ratio=curr_mask_ratio)
+            reconstructed, mask, decoded, centers, group_idx = model(batch_hits, mask_ratio=curr_mask_ratio)
             
             # 3. Use pre-computed indices to extract targets (Zero Redundancy)
             target_pts = index_points(full_targets, group_idx)
@@ -675,26 +721,60 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
             masked_targets = target_pts_local[mask_bool]
             masked_preds = reconstructed[mask_bool]
             
-            # Energy-weighted loss
-            weights = target_pts[mask_bool][:, :, 3] # Use original energy for weighting
-            loss_raw = nn.SmoothL1Loss(reduction='none')(masked_preds, masked_targets).mean(dim=-1)
+            # 1. Standard Recon Loss (SmoothL1)
+            # Energy-weighted loss for all features
+            weights = target_pts[mask_bool][:, :, 3:4] # (N_masked, K, 1)
+            loss_raw = nn.SmoothL1Loss(reduction='none')(masked_preds, masked_targets)
             recon_loss = (loss_raw * weights).mean()
             
-            # 4. Variance Loss (Explicit Diversity)
-            # Penalize low variance across patches to prevent mode collapse
-            # patch_means: (N_masked, D)
+            # 2. Chamfer Loss for Coordinate Diversity (Focus on XYZ)
+            # This encourages the model to place points in the right places regardless of order
+            chamfer_loss = compute_chamfer_loss(masked_preds, masked_targets)
+            
+            # 3. Variance Loss (Stronger Diversity)
+            # Variance across patches (Global diversity)
             patch_means = masked_preds.mean(dim=1)
             var_across = patch_means.var(dim=0).mean()
-            var_loss = 1.0 / (var_across + 1e-6)
+            target_var_across = 0.05
+            var_across_loss = torch.relu(target_var_across - var_across) / target_var_across
             
-            loss = recon_loss + 0.01 * var_loss
+            # Variance within patches (Local diversity/spread)
+            # This directly penalizes points overlapping at the center
+            var_within = masked_preds[:, :, :3].var(dim=1).mean()
+            target_var_within = masked_targets[:, :, :3].var(dim=1).mean().detach()
+            var_within_loss = nn.MSELoss()(var_within, target_var_within)
+            
+            # 4. Latent Diversity Loss (Encourage unique mask tokens)
+            # Minimizing cosine similarity between decoder latents for masked patches
+            mask_bool = mask.bool()
+            decoded_masked = decoded[mask_bool] # (N_masked, D_dec)
+            if len(decoded_masked) > 1:
+                # Sample if too many
+                if len(decoded_masked) > 256:
+                    indices = torch.randperm(len(decoded_masked))[:256]
+                    decoded_masked = decoded_masked[indices]
+                
+                dec_norm = nn.functional.normalize(decoded_masked, p=2, dim=-1)
+                cos_sim = torch.mm(dec_norm, dec_norm.t()) # (N, N)
+                # Average off-diagonal similarity
+                latent_loss = (cos_sim.sum() - len(cos_sim)) / (len(cos_sim) * (len(cos_sim) - 1))
+            else:
+                latent_loss = torch.tensor(0.0, device=device)
+            
+            # Increased weight for Chamfer and added var_within_loss
+            loss = recon_loss + 2.0 * chamfer_loss + 0.5 * var_across_loss + 1.0 * var_within_loss + 0.2 * latent_loss
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
             total_train_loss += loss.item()
-            pbar.set_postfix(loss=loss.item(), var=var_across.item())
+            pbar.set_postfix(
+                loss=loss.item(), 
+                chamfer=chamfer_loss.item(), 
+                v_in=var_within.item(), 
+                v_out=var_across.item()
+            )
 
         scheduler.step()
         num_batches = i + 1
@@ -746,7 +826,10 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 m_targets = target_pts_local[mask_bool]
                 m_preds = reconstructed[mask_bool]
                 
-                loss = nn.SmoothL1Loss()(m_preds, m_targets)
+                recon_loss = nn.SmoothL1Loss()(m_preds, m_targets)
+                chamfer_loss = compute_chamfer_loss(m_preds, m_targets)
+                
+                loss = recon_loss + 0.5 * chamfer_loss
                 total_val_loss += loss.item()
                 
                 # Density analysis
@@ -797,7 +880,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         plot_metrics_history(metrics_history, output_dir)
         epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss, 0, 0)) 
 
-        visualize_embeddings_3d(model, train_dataset, epoch, output_dir, n_events=1)
+        visualize_embeddings(model, train_dataset, epoch, output_dir, n_events=1)
         visualize_reconstruction(model, val_dataloader, epoch, output_dir, n_events=2, mask_ratio=curr_mask_ratio)
 
     # Save model
