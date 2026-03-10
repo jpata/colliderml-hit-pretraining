@@ -29,6 +29,7 @@ def main():
     plt.xlabel('Max Events (Dataset Size)')
     plt.ylabel('Loss')
     plt.xscale('log')
+    plt.yscale('log')
     plt.title('Loss vs Training Dataset Size')
     plt.legend()
     plt.grid(True)
