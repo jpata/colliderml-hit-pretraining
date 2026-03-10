@@ -13,6 +13,7 @@ import time
 import polars as pl
 from pathlib import Path
 from hilbert import hilbert_index_3d
+import matplotlib.pyplot as plt
 
 class CalorimeterDataset(IterableDataset):
     @staticmethod
@@ -266,9 +267,150 @@ class NeighborhoodCalorimeterDataset(CalorimeterDataset):
         return torch.from_numpy(hits)
 
 if __name__ == "__main__":
-    ds = CalorimeterDataset(num_hits=1024, max_events=50, verbose=True)
+    ds_full = CalorimeterDataset(num_hits=1024, max_events=None, verbose=False)
+    print(f"Total events available in dataset: {len(ds_full)}")
+    
+    ds = CalorimeterDataset(num_hits=1024, max_events=100, verbose=True)
+    print(f"Running validation on {len(ds)} events...")
+    
     start = time.time()
+    all_hits = []
     for i, event in enumerate(ds):
         if i % 10 == 0:
             print(f"Yielded event {i}, time since last: {time.time()-start:.4f}s")
             start = time.time()
+        all_hits.append(event.numpy())
+    
+    all_hits = np.concatenate(all_hits, axis=0)
+    # Mask out padding (0,0,0,0,0)
+    mask = np.any(all_hits != 0, axis=1)
+    valid_hits = all_hits[mask]
+    
+    print(f"Collected {len(valid_hits)} valid hits from {len(ds)} events.")
+    
+    # Compute additional precomputed features (density and energy density)
+    def compute_density_np(hits, radii=[0.01, 0.02, 0.05]):
+        # hits: (N, 4)
+        hits_torch = torch.from_numpy(hits).unsqueeze(0) # (1, N, 4)
+        coords = hits_torch[:, :, :3]
+        energies = hits_torch[:, :, 3]
+        dist_sq = torch.cdist(coords, coords)**2
+        
+        density_features = []
+        energy_features = []
+        for r in radii:
+            mask = (dist_sq < r**2).float()
+            d = torch.log10(mask.sum(dim=2) + 1.0)
+            e_sum = torch.log10(torch.bmm(mask, energies.unsqueeze(-1)).squeeze(-1) + 1.0)
+            density_features.append(d.squeeze(0))
+            energy_features.append(e_sum.squeeze(0))
+            
+        return torch.stack(density_features + energy_features, dim=-1).numpy()
+
+    # Let's re-collect hits and compute features per event
+    all_hits_with_features = []
+    sampled_calo_multiplicities = []
+    sampled_tracker_multiplicities = []
+    full_calo_multiplicities = []
+    full_tracker_multiplicities = []
+    
+    print("Collecting full event multiplicities and computing features...")
+    for i in range(len(ds)):
+        # Get full event for true multiplicity
+        full_event = ds.get_full_event(i)
+        full_calo_multiplicities.append(len(full_event["calo_hits"]))
+        full_tracker_multiplicities.append(len(full_event["tracker_hits"]))
+    
+    # Reset iterator to get sampled hits
+    ds.epoch = 0 
+    for i, event in enumerate(ds):
+        hits = event.numpy()
+        mask = np.any(hits != 0, axis=1)
+        v_hits = hits[mask]
+        
+        # Collect sampled multiplicity (limited by num_hits)
+        calo_count = np.sum(v_hits[:, 4] == 0)
+        tracker_count = np.sum(v_hits[:, 4] == 1)
+        sampled_calo_multiplicities.append(calo_count)
+        sampled_tracker_multiplicities.append(tracker_count)
+
+        if len(v_hits) > 0:
+            densities = compute_density_np(v_hits[:, :4])
+            all_hits_with_features.append(np.concatenate([v_hits, densities], axis=1))
+    
+    valid_hits_extended = np.concatenate(all_hits_with_features, axis=0)
+    
+    # Create validation plots
+    os.makedirs("validation_plots", exist_ok=True)
+    
+    # Multiplicity Plots
+    plt.figure(figsize=(15, 10))
+    # Full Events
+    plt.subplot(2, 2, 1)
+    plt.hist(full_calo_multiplicities, bins=50, color='blue', alpha=0.7)
+    plt.title("Full Event: Calorimeter Hit Multiplicity")
+    plt.xlabel("Number of Hits")
+    plt.subplot(2, 2, 2)
+    plt.hist(full_tracker_multiplicities, bins=50, color='green', alpha=0.7)
+    plt.title("Full Event: Tracker Hit Multiplicity")
+    plt.xlabel("Number of Hits")
+    # Sampled Chunks
+    plt.subplot(2, 2, 3)
+    plt.hist(sampled_calo_multiplicities, bins=50, color='blue', alpha=0.5)
+    plt.title(f"Sampled Chunk (max={ds.num_hits}): Calo Multiplicity")
+    plt.xlabel("Number of Hits")
+    plt.subplot(2, 2, 4)
+    plt.hist(sampled_tracker_multiplicities, bins=50, color='green', alpha=0.5)
+    plt.title(f"Sampled Chunk (max={ds.num_hits}): Tracker Multiplicity")
+    plt.xlabel("Number of Hits")
+    plt.tight_layout()
+    plt.savefig("validation_plots/multiplicity_distributions.png")
+    plt.close()
+    
+    # Coordinates
+    plt.figure(figsize=(15, 5))
+    for i, label in enumerate(["x", "y", "z"]):
+        plt.subplot(1, 3, i+1)
+        plt.hist(valid_hits_extended[:, i], bins=100)
+        plt.title(f"Distribution of {label}")
+    plt.tight_layout()
+    plt.savefig("validation_plots/coord_distributions.png")
+    plt.close()
+    
+    # Energy
+    plt.figure(figsize=(8, 6))
+    plt.hist(valid_hits_extended[:, 3], bins=100)
+    plt.title("Log10(Energy/1e-6 + 1.0) Distribution")
+    plt.xlabel("Log10 Energy")
+    plt.savefig("validation_plots/energy_distribution.png")
+    plt.close()
+    
+    # Hit Densities (Radii: 0.01, 0.02, 0.05)
+    plt.figure(figsize=(15, 5))
+    for i, r in enumerate([0.01, 0.02, 0.05]):
+        plt.subplot(1, 3, i+1)
+        plt.hist(valid_hits_extended[:, 5+i], bins=100)
+        plt.title(f"Hit Density (r={r})")
+    plt.tight_layout()
+    plt.savefig("validation_plots/hit_density_distributions.png")
+    plt.close()
+    
+    # Energy Densities (Radii: 0.01, 0.02, 0.05)
+    plt.figure(figsize=(15, 5))
+    for i, r in enumerate([0.01, 0.02, 0.05]):
+        plt.subplot(1, 3, i+1)
+        plt.hist(valid_hits_extended[:, 8+i], bins=100)
+        plt.title(f"Energy Density (r={r})")
+    plt.tight_layout()
+    plt.savefig("validation_plots/energy_density_distributions.png")
+    plt.close()
+    
+    # Hit Types
+    plt.figure(figsize=(8, 6))
+    plt.hist(valid_hits_extended[:, 4], bins=3, range=(-0.5, 1.5))
+    plt.xticks([0, 1], ["Calo (0)", "Tracker (1)"])
+    plt.title("Hit Type Distribution")
+    plt.savefig("validation_plots/hittype_distribution.png")
+    plt.close()
+
+    print("Validation plots (including densities) saved to 'validation_plots/' directory.")
