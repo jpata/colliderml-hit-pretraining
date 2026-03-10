@@ -24,7 +24,8 @@ rule train:
             --epochs 2 \
             --batch_size 16 \
             --output_dir {params.output_dir} \
-            --output_loss loss.txt
+            --output_loss loss.txt \
+            --output_checkpoint checkpoint.pth
         """
 
 rule aggregate:

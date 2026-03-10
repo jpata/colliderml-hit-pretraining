@@ -957,7 +957,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         plot_fidelity_vs_density(density_stats, epoch, output_dir, writer=writer)
 
     # Save model
-    save_path = os.path.join(output_dir, f"checkpoint_h{num_hits}_patches.pth")
+    ckpt_name = output_checkpoint if output_checkpoint else f"checkpoint_h{num_hits}_patches.pth"
+    save_path = os.path.join(output_dir, ckpt_name)
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to {save_path}")
     writer.close()
@@ -980,6 +981,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--output_loss", type=str, default=None)
+    parser.add_argument("--output_checkpoint", type=str, default=None)
     parser.add_argument("--neighborhood", type=str, choices=["True", "False"], default="True")
     parser.add_argument("--mask_ratio", type=float, default=0.5)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -999,6 +1001,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         output_dir=args.output_dir,
         output_loss=args.output_loss,
+        output_checkpoint=args.output_checkpoint,
         use_neighborhood=use_neighborhood,
         mask_ratio=args.mask_ratio,
         lr=args.lr,
