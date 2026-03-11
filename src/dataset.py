@@ -10,10 +10,10 @@ from torch.utils.data import IterableDataset, get_worker_info
 import numpy as np
 import os
 import time
-import polars as pl
 from pathlib import Path
 from hilbert import hilbert_index_3d
 import matplotlib.pyplot as plt
+import multiprocessing as mp
 
 class CalorimeterDataset(IterableDataset):
     @staticmethod
@@ -46,7 +46,7 @@ class CalorimeterDataset(IterableDataset):
         self.max_events = max_events
         self.skip_events = skip_events
         self.chunk_size = chunk_size
-        self.epoch = 0
+        self._epoch = mp.Value("i", 0)
         
         # Identify shards dynamically from cache
         cache_root = Path(os.getenv("COLLIDERML_DATA_DIR", "~/.cache/colliderml")).expanduser()
@@ -139,15 +139,24 @@ class CalorimeterDataset(IterableDataset):
 
     def set_epoch(self, epoch):
         """Used to update the epoch for randomization across epochs."""
-        self.epoch = epoch
+        self._epoch.value = epoch
+
+    @property
+    def epoch(self):
+        return self._epoch.value
 
     def __iter__(self):
+        import polars as pl
+        os.environ["POLARS_MAX_THREADS"] = "1"
+        
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
         
+        current_epoch = self.epoch
+        
         # Use SeedSequence to ensure unique, robust streams across workers/epochs
-        ss = np.random.SeedSequence([self.epoch, worker_id])
+        ss = np.random.SeedSequence([current_epoch, worker_id])
         
         # Determine global max_events per worker
         if self.max_events is not None:
@@ -178,10 +187,14 @@ class CalorimeterDataset(IterableDataset):
             start_within_shard = max(0, self.skip_events - shard_global_start)
             
             if self.verbose:
-                print(f"Worker {worker_id} processing calo shard {calo_path.name}, skipping {start_within_shard} events.")
+                print(f"Worker {worker_id} processing calo shard {calo_path.name}")
             
-            l_calo = pl.scan_parquet(calo_path, low_memory=True)
-            l_tracker = pl.scan_parquet(tracker_path, low_memory=True) if tracker_path else None
+            try:
+                l_calo = pl.scan_parquet(calo_path, low_memory=True)
+                l_tracker = pl.scan_parquet(tracker_path, low_memory=True) if tracker_path else None
+            except Exception as e:
+                print(f"[Worker {worker_id}] Error scanning parquet: {e}")
+                break
             
             for chunk_start in range(0, self.rows_per_shard, self.chunk_size):
                 chunk_end = chunk_start + self.chunk_size
@@ -198,8 +211,7 @@ class CalorimeterDataset(IterableDataset):
                     c_chunk = l_calo.slice(slice_start, slice_len).collect()
                     t_chunk = l_tracker.slice(slice_start, slice_len).collect() if l_tracker is not None else None
                 except Exception as e:
-                    if self.verbose:
-                        print(f"Error reading chunk in shard {s_idx}: {e}")
+                    print(f"[Worker {worker_id}] Error reading chunk in shard {s_idx}: {e}")
                     break
                 
                 raw_events = self._process_chunk(c_chunk, t_chunk)
@@ -238,6 +250,7 @@ class CalorimeterDataset(IterableDataset):
 
     def get_full_event(self, idx):
         """Sparse access for visualization only."""
+        import polars as pl
         shard_idx = idx // self.rows_per_shard
         rel_idx = idx % self.rows_per_shard
         
@@ -283,6 +296,7 @@ class NeighborhoodCalorimeterDataset(CalorimeterDataset):
         return torch.from_numpy(hits)
 
 if __name__ == "__main__":
+    import polars as pl
     ds_full = CalorimeterDataset(num_hits=1024, max_events=None, verbose=False)
     print(f"Total events available in dataset: {len(ds_full)}")
     

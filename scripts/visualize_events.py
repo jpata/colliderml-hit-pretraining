@@ -12,6 +12,39 @@ from tqdm import tqdm
 # Import central definitions to ensure consistency
 from train_example import MaskedPointModel, compute_all_hit_representations
 
+def compute_hit_metadata_gpu(hit_coords, patch_centers, patch_embeddings, patch_labels, k=5):
+    """
+    Computes hit-level embeddings and cluster labels from patch metadata via GPU.
+    """
+    device = hit_coords.device
+    N = hit_coords.shape[0]
+    
+    chunk_size = 16384
+    all_hit_embeddings = []
+    all_hit_labels = []
+    
+    patch_labels_torch = torch.from_numpy(patch_labels).to(device)
+    
+    for i in range(0, N, chunk_size):
+        chunk_coords = hit_coords[i:i+chunk_size]
+        dists = torch.cdist(chunk_coords, patch_centers)
+        
+        # 1. For Embeddings: IDW over K neighbors
+        dists_k, indices_k = dists.topk(k, dim=1, largest=False)
+        weights = 1.0 / torch.clamp(dists_k, min=1e-8)
+        weights /= weights.sum(dim=1, keepdim=True)
+        
+        neighbor_embeddings = patch_embeddings[indices_k]
+        hit_emb_chunk = torch.sum(neighbor_embeddings * weights.unsqueeze(-1), dim=1)
+        all_hit_embeddings.append(hit_emb_chunk.cpu())
+        
+        # 2. For Labels: Nearest patch assignment
+        nearest_patch_idx = dists.argmin(dim=1)
+        hit_labels_chunk = patch_labels_torch[nearest_patch_idx]
+        all_hit_labels.append(hit_labels_chunk.cpu())
+        
+    return torch.cat(all_hit_embeddings, dim=0), torch.cat(all_hit_labels, dim=0)
+
 def visualize_event(model, event_data, event_type, output_dir, window_size=1024, overlap=None):
     model.eval()
     device = next(model.parameters()).device
@@ -28,42 +61,33 @@ def visualize_event(model, event_data, event_type, output_dir, window_size=1024,
         overlap = window_size // 4
         
     # Compute embeddings for all patches in the full event
-    # window_size matches training num_hits and provides 3D-local context
+    # This is now optimized via batching in compute_all_hit_representations
     embeddings, centers = compute_all_hit_representations(model, all_hits, window_size=window_size, overlap=overlap)
-    embeddings = embeddings.numpy()
-    centers = centers.numpy()
     
     print(f"    - Event {event_id}: {all_hits_np.shape[0]} hits, {len(embeddings)} patches")
     
-    # 1. UMAP projection of PATCH embeddings
-    # We define the latent space structure using only the patches
-    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2, random_state=42)
-    umap_patch_coords = reducer.fit_transform(embeddings)
-    
-    # 2. DBSCAN clustering on patches
-    clustering = DBSCAN(eps=0.5, min_samples=3).fit(umap_patch_coords)
+    # 1. DBSCAN clustering on full PATCH embeddings
+    # This defines the semantic structure in the high-dim space before visualization
+    embeddings_np = embeddings.numpy()
+    clustering = DBSCAN(eps=1.0, min_samples=3).fit(embeddings_np)
     patch_labels = clustering.labels_
     
-    # 3. Compute hit embeddings via IDW of N nearest patches
-    N_neighbors = 5
-    tree = KDTree(centers)
-    distances, indices = tree.query(all_hits_np[:, :3], k=N_neighbors)
+    # 2. UMAP projection for visualization
+    # We define the latent space structure for plotting
+    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2, random_state=42)
+    umap_patch_coords = reducer.fit_transform(embeddings_np)
     
-    # Avoid division by zero and compute weights
-    distances = np.maximum(distances, 1e-8)
-    weights = 1.0 / distances
-    weights /= weights.sum(axis=1, keepdims=True)
+    # 3. Compute hit embeddings and labels via GPU
+    hit_embeddings_torch, hit_labels_torch = compute_hit_metadata_gpu(
+        all_hits[:, :3], centers.to(device), embeddings.to(device), patch_labels, k=5
+    )
     
-    # Compute weighted average of patch embeddings for each hit
-    neighbor_embeddings = embeddings[indices] # (N_hits, N_neighbors, D)
-    hit_embeddings = np.sum(neighbor_embeddings * weights[:, :, np.newaxis], axis=1)
+    hit_embeddings = hit_embeddings_torch.numpy()
+    hit_labels = hit_labels_torch.numpy()
     
     # Project hits into the same UMAP space as patches
     print(f"    - Projecting {len(hit_embeddings)} hits to UMAP space...")
     umap_hit_coords = reducer.transform(hit_embeddings)
-    
-    # Use nearest patch for cluster assignment (coloring)
-    hit_labels = patch_labels[indices[:, 0]]
     
     # --- Plotting ---
     fig = plt.figure(figsize=(20, 10))
@@ -101,7 +125,7 @@ def visualize_event(model, event_data, event_type, output_dir, window_size=1024,
     ax2.scatter(umap_patch_coords[:, 0], umap_patch_coords[:, 1], 
                 c=center_colors, s=40, edgecolors='black', linewidth=0.5, label='Patches', alpha=0.6)
     
-    ax2.set_title(f"Latent Space: UMAP Projection\nColored by DBSCAN Clusters (IDW Hit Projection)")
+    ax2.set_title(f"Latent Space: UMAP Projection\nColored by DBSCAN Clusters (Full Embedding Clustering)")
     ax2.set_xlabel('UMAP 1'); ax2.set_ylabel('UMAP 2')
     ax2.legend()
     

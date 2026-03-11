@@ -1,6 +1,6 @@
 [workspace]
 authors = ["Joosep Pata <joosep.pata@gmail.com>"]
-channels = ["pytorch", "conda-forge", "bioconda"]
+channels = ["pytorch", "conda-forge", "bioconda", "pyg"]
 name = "pytorch-train"
 platforms = ["linux-64"]
 version = "0.1.0"
@@ -57,14 +57,20 @@ download-ggf = "colliderml download --channels ggf --pileup pu0 --objects partic
 download = { depends-on = ["download-ttbar", "download-ggf"] }
 
 [dependencies]
-python = "*"
-libstdcxx-ng = "*"
+python = "==3.11"
+#libstdcxx-ng = "*"
 umap-learn = ">=0.5.11,<0.6"
 setuptools = "==81.0.0"
 snakemake = ">=8.0"
 snakemake-executor-plugin-slurm = "*"
 snakemake-executor-plugin-cluster-generic = "*"
-pyyaml = "*"
+
+[pypi-options]
+index-strategy = "unsafe-best-match"
+extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
+find-links = [
+  { url = "https://data.pyg.org/whl/torch-2.9.1+cu128.html" }
+]
 
 [pypi-dependencies]
 colliderml = "*"
@@ -75,11 +81,17 @@ pandas = "*"
 tqdm = "*"
 matplotlib = "*"
 seaborn = "*"
-torch = "*"
+tensorboard = ">=2.20.0"
+addict = "*"
+timm = "*"
+h5py = "*"
+huggingface_hub = "*"
+spconv-cu120 = "*"
+torch-scatter = "*"
+pyyaml = "*"
+torch = "==2.9.1"
 torchvision = "*"
 torchaudio = "*"
-tensorboard = ">=2.20.0"
-setuptools = "==81.0.0"
 
 [environments]
 tallinn = ["tallinn"]

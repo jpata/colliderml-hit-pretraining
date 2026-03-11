@@ -173,20 +173,17 @@ from hilbert import hilbert_index_3d
 
 import time
 
-def compute_all_hit_representations(model, hits, window_size=1024, overlap=None, return_windows=False):
+def compute_all_hit_representations(model, hits, window_size=1024, overlap=None, return_windows=False, batch_size=32):
     """
     Computes embeddings for patches in an event.
     Returns embeddings for patch centers and optionally the hits in each window.
     Uses Hilbert sorting for 3D-local windows, matching the training distribution.
+    Optimized via batching for high-throughput inference.
     """
     if overlap is None:
         overlap = window_size // 4
         
     N = hits.shape[0]
-    step = max(1, window_size - overlap)
-    n_windows = (N + step - 1) // step
-    print(f"\n[DEBUG] compute_all_hit_representations: N={N}, window_size={window_size}, overlap={overlap}, step={step}, n_windows={n_windows}")
-    
     if N == 0:
         device = next(model.parameters()).device
         embed_dim = model.pos_embed.shape[-1]
@@ -201,66 +198,59 @@ def compute_all_hit_representations(model, hits, window_size=1024, overlap=None,
     h_indices = hilbert_index_3d(coords)
     sorted_indices = torch.from_numpy(np.argsort(h_indices)).to(device)
     sorted_hits = hits[sorted_indices]
-    print(f"[DEBUG] Hilbert sorting took {time.time() - t0:.4f}s")
-    
-    all_latents = []
-    all_coords = []
-    all_windows = []
     
     step = max(1, window_size - overlap)
-    n_windows = (N + step - 1) // step
-    print(f"[DEBUG] Processing approx {n_windows} windows (step={step})")
     
+    # 1. Collect all windows
+    all_windows_hits = []
+    window_start_indices = list(range(0, N, step))
+    
+    for start in window_start_indices:
+        end = min(start + window_size, N)
+        window_hits = sorted_hits[start:end]
+        curr_size = window_hits.shape[0]
+        
+        # Pad if window is smaller than window_size (for FPS consistency)
+        if curr_size < window_size:
+            idx = torch.randint(0, curr_size, (window_size - curr_size,), device=device)
+            padding = window_hits[idx]
+            input_hits = torch.cat([window_hits, padding], dim=0)
+        else:
+            input_hits = window_hits
+        all_windows_hits.append(input_hits)
+
+    if not all_windows_hits:
+        return (torch.empty(0, model.pos_embed.shape[-1]), torch.empty(0, 3), []) if return_windows else (torch.empty(0, model.pos_embed.shape[-1]), torch.empty(0, 3))
+
+    # 2. Batched Inference
     model.eval()
-    t_start = time.time()
+    all_latents = []
+    all_coords = []
+    
     with torch.no_grad():
-        for start in range(0, N, step):
-            end = min(start + window_size, N)
-            window_hits = sorted_hits[start:end]
+        # Process in chunks of batch_size windows to manage memory
+        for i in range(0, len(all_windows_hits), batch_size):
+            batch = torch.stack(all_windows_hits[i:i+batch_size], dim=0)
             
-            curr_size = window_hits.shape[0]
-            if curr_size == 0:
-                if end == N: break
-                continue
-            
-            if return_windows:
-                all_windows.append(window_hits.cpu())
-            
-            # Pad if window is smaller than window_size (for FPS consistency if needed)
-            if curr_size < window_size:
-                idx = torch.randint(0, curr_size, (window_size - curr_size,), device=device)
-                padding = window_hits[idx]
-                input_hits = torch.cat([window_hits, padding], dim=0).unsqueeze(0)
-            else:
-                input_hits = window_hits.unsqueeze(0)
-                
             # Patch mode: returns (B, G, E), (B, G, 3), (B, G, K, C), (B, G, K)
-            # input_hits is (1, window_size, 5)
-            tokens, centers, _, _ = model.patch_embed(input_hits)
+            tokens, centers, _, _ = model.patch_embed(batch)
+            
+            # Use coordinate-based embeddings (scaled pos_embed if needed, though here we match n_patches)
             tokens = tokens + model.pos_embed[:, :tokens.shape[1], :]
             latent = model.encoder(tokens)
             
-            all_latents.append(latent[0].cpu())
-            all_coords.append(centers[0].cpu())
-            
-            if (start // step) % 10 == 0:
-                print(f"[DEBUG] Window {start // step}/{n_windows}: input_hits={input_hits.shape}, tokens={tokens.shape}")
-            
-            if end == N: break
-                
-    print(f"[DEBUG] Window processing took {time.time() - t_start:.4f}s total")
-    
-    if not all_latents:
-        embed_dim = model.pos_embed.shape[-1]
-        res = (torch.empty((0, embed_dim)), torch.empty((0, 3)))
-        return res + ([],) if return_windows else res
+            # Store results
+            all_latents.append(latent.reshape(-1, latent.shape[-1]).cpu())
+            all_coords.append(centers.reshape(-1, 3).cpu())
 
     final_latents = torch.cat(all_latents, dim=0)
     final_coords = torch.cat(all_coords, dim=0)
-    print(f"[DEBUG] Final representations: latents={final_latents.shape}, coords={final_coords.shape}")
     
     if return_windows:
+        # Re-extract windows for return (on CPU to save memory)
+        all_windows = [w.cpu() for w in all_windows_hits]
         return final_latents, final_coords, all_windows
+    
     return final_latents, final_coords
 
 def compute_collapse_metrics(masked_preds, decoded, mask, targets=None):
@@ -343,7 +333,7 @@ def compute_representation_metrics(all_embeddings, all_hits, epoch, output_dir):
     emb_sample = all_embeddings[indices]
     hits_sample = all_hits[indices]
     
-    clustering = DBSCAN(eps=0.5, min_samples=3).fit(emb_sample)
+    clustering = DBSCAN(eps=1.0, min_samples=3).fit(emb_sample)
     labels = clustering.labels_
     unique_labels = np.unique(labels)
     n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
@@ -480,7 +470,7 @@ def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, win
         coords_np = coords.numpy()
         
         print(f"    - Running DBSCAN for event {i}")
-        clustering = DBSCAN(eps=0.5, min_samples=3).fit(embeddings_np)
+        clustering = DBSCAN(eps=1.0, min_samples=3).fit(embeddings_np)
         clusters = clustering.labels_
         
         fig = plt.figure(figsize=(10, 8))
@@ -498,7 +488,7 @@ def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, win
         ax.scatter(coords_np[:, 0], coords_np[:, 1],
                   c=get_colors(clusters), marker='o', s=20)
             
-        ax.set_title(f'Event {event_data["event_id"]} - Epoch {epoch+1}\n(DBSCAN on Patches)')
+        ax.set_title(f'Event {event_data["event_id"]} - Epoch {epoch+1}\n(DBSCAN on Full Embeddings)')
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         print(f"    - Saving point cloud plot for event {i}")
