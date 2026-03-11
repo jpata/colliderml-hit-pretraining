@@ -758,7 +758,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         batch_size=batch_size, 
         num_workers=4, 
         prefetch_factor=4,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True
     )
     val_dataloader = DataLoader(
         val_dataset, 

@@ -27,8 +27,10 @@ jobscript: "jobscript.sh"
 jobs: unlimited
 restart-times: 0
 max-jobs-per-second: 1
-jobs: 1
 max-status-checks-per-second: 1
+slurm-init-seconds-before-status-checks: 60
+seconds-between-status-checks: 60
+latency-wait: 60
 verbose: true
 use-conda: false
 default-resources:

@@ -1,6 +1,6 @@
 DATASET_SIZES = [100, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]
-NUM_HITS = 256
-EMBED_DIM = 32
+NUM_HITS = 1024
+EMBED_DIM = 64
 NEIGHBORHOOD = "True"
 
 rule all:
@@ -18,17 +18,18 @@ rule train:
         slurm_partition="gpu",
         gres="gpu:l40:1",
         mem_mb=20000,
-        runtime=120,
+        runtime=240,
         cpus_per_task=8
     shell:
         """
+        env
         python scripts/train_example.py \
             --num_hits {NUM_HITS} \
             --embed_dim {EMBED_DIM} \
             --max_events {wildcards.max_events} \
             --neighborhood {NEIGHBORHOOD} \
-            --epochs 2 \
-            --batch_size 16 \
+            --epochs 20 \
+            --batch_size 128 \
             --output_dir {params.output_dir} \
             --output_loss loss.txt \
             --output_checkpoint checkpoint.pth
@@ -40,27 +41,19 @@ rule aggregate:
     output:
         "scan_results_snakemake.csv"
     resources:
-        mem_mb=4000,
-        runtime=10
-    run:
-        import os
-        import pandas as pd
-        rows = []
-        for s in DATASET_SIZES:
-            loss_file = f"results/s{s}/loss.txt"
-            if os.path.exists(loss_file):
-                df = pd.read_csv(loss_file)
-                if not df.empty:
-                    final_val_loss = df.iloc[-1]["val_loss"]
-                    rows.append({
-                        "max_events": s, 
-                        "loss": final_val_loss, 
-                        "neighborhood": NEIGHBORHOOD,
-                        "num_hits": NUM_HITS,
-                        "embed_dim": EMBED_DIM
-                    })
-        
-        pd.DataFrame(rows).to_csv(output[0], index=False)
+        mem_mb=8000,
+        runtime=60,
+        cpus_per_task=1
+    shell:
+        """
+        env
+        python scripts/aggregate_results.py \
+            --dataset_sizes {DATASET_SIZES} \
+            --num_hits {NUM_HITS} \
+            --embed_dim {EMBED_DIM} \
+            --neighborhood {NEIGHBORHOOD} \
+            --output {output[0]}
+        """
 
 rule visualize:
     input:
@@ -68,9 +61,11 @@ rule visualize:
     output:
         "loss_scaling.png"
     resources:
-        mem_mb=4000,
-        runtime=10
+        mem_mb=8000,
+        runtime=60,
+        cpus_per_task=1
     shell:
         """
+        env
         python scripts/visualize_scan.py
         """
