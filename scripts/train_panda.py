@@ -33,7 +33,7 @@ from Panda.panda.utils import collate_fn, set_seed
 from src.dataset import CalorimeterDataset, NeighborhoodCalorimeterDataset
 
 class PandaHead(nn.Module):
-    def __init__(self, in_channels, out_channels, num_prototypes=4096, bottleneck_dim=256):
+    def __init__(self, in_channels, num_prototypes=512, bottleneck_dim=256):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(in_channels, bottleneck_dim),
@@ -59,12 +59,14 @@ class PandaHead(nn.Module):
 from Panda.panda.transform import Compose
 
 class MultiViewDatasetWrapper(IterableDataset):
-    def __init__(self, dataset, n_local_views=2, global_view_scale=(0.4, 1.0), local_view_scale=(0.1, 0.4), mask_ratio=0.5):
+    def __init__(self, dataset, n_local_views=2, global_view_scale=(0.4, 1.0), local_view_scale=(0.1, 0.4), 
+                 mask_ratio=0.5, patch_size=0.05):
         self.dataset = dataset
         self.n_local_views = n_local_views
         self.global_view_scale = global_view_scale
         self.local_view_scale = local_view_scale
         self.mask_ratio = mask_ratio
+        self.patch_size = patch_size # Size of the voxel grid patch in normalized coordinates
         
         # PANDA-like normalization and sparse grid sampling
         self.transform = Compose([
@@ -105,10 +107,36 @@ class MultiViewDatasetWrapper(IterableDataset):
 
     def _mask_hits(self, processed_view):
         """
-        Randomly mask points for the student.
+        Voxel-grid patch masking: points within the same grid cell are masked together.
         """
-        n_points = processed_view["coord"].shape[0]
-        mask = torch.rand(n_points) < self.mask_ratio
+        coords = torch.from_numpy(processed_view["coord"])
+        n_points = coords.shape[0]
+        
+        # 1. Project coordinates to grid indices
+        # We use self.patch_size to define the resolution of the masking "cubes"
+        grid_indices = torch.floor(coords / self.patch_size).long()
+        
+        # 2. Create unique IDs for each occupied grid cell
+        # We use a simple hash to get a unique 1D index for each 3D cell
+        # Shift to positive and combine
+        min_idx = grid_indices.min(dim=0)[0]
+        grid_indices -= min_idx
+        max_idx = grid_indices.max(dim=0)[0] + 1
+        
+        unique_cell_ids = (grid_indices[:, 0] * max_idx[1] * max_idx[2] + 
+                           grid_indices[:, 1] * max_idx[2] + 
+                           grid_indices[:, 2])
+        
+        # 3. Randomly select which cells to mask
+        unique_cells = torch.unique(unique_cell_ids)
+        n_cells = unique_cells.shape[0]
+        
+        mask_indices = torch.randperm(n_cells)[:int(n_cells * self.mask_ratio)]
+        masked_cells = unique_cells[mask_indices]
+        
+        # 4. Map masked cells back to points
+        mask = torch.isin(unique_cell_ids, masked_cells)
+        
         return mask
 
     def __iter__(self):
@@ -178,8 +206,8 @@ def panda_collate_fn(batch):
     }
 
 @torch.no_grad()
-def sinkhorn_knopp(teacher_logits, eps=0.05, iterations=3):
-    Q = torch.exp(teacher_logits / eps).t()
+def sinkhorn_knopp(teacher_logits, temp=0.1, iterations=10):
+    Q = torch.exp(teacher_logits / temp).t()
     B = Q.shape[1]
     K = Q.shape[0]
     # Standard Sinkhorn normalization
@@ -218,8 +246,15 @@ class PandaTrainer:
         # PTv3 upcasts by concatenating features. Total dim = sum(enc_channels)
         total_feat_dim = sum(backbone_config["enc_channels"])
         
-        self.student_head = PandaHead(total_feat_dim, 4096).to(self.device)
-        self.teacher_head = PandaHead(total_feat_dim, 4096).to(self.device)
+        self.num_prototypes = args.num_prototypes
+        self.student_head = PandaHead(total_feat_dim, self.num_prototypes).to(self.device)
+        self.teacher_head = PandaHead(total_feat_dim, self.num_prototypes).to(self.device)
+        
+        # Tracking buffer for prototype usage (counts per prototype)
+        self.prototype_counts = torch.zeros(self.num_prototypes, device=self.device)
+        
+        # Centering buffer for teacher logits (anti-collapse)
+        self.center = torch.zeros(1, self.num_prototypes, device=self.device)
         
         # Sync teacher with student
         self.teacher_backbone.load_state_dict(self.student_backbone.state_dict())
@@ -303,27 +338,43 @@ class PandaTrainer:
             ax2 = fig.add_subplot(122)
             
             coords = processed["coord"]
+            hit_types = processed["hit_type"].flatten()
             unique_labels = np.unique(labels)
             n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
             
             cmap = plt.get_cmap('tab20')
-            colors = [cmap(l % 20) if l != -1 else (0, 0, 0, 0.1) for l in labels]
+            colors = np.array([cmap(l % 20) if l != -1 else (0, 0, 0, 0.1) for l in labels])
             
             # Constant marker size for both plots
-            marker_size = 10
+            marker_size = 5
             
+            # Masks for calo (0) and tracker (1) hits
+            calo_mask = hit_types == 0
+            tracker_mask = hit_types == 1
+
             # Plot 1: 3D Hit Coordinates
-            ax1.scatter(coords[:, 0], coords[:, 1], coords[:, 2], 
-                        c=colors, s=marker_size, alpha=0.6)
+            if calo_mask.any():
+                ax1.scatter(coords[calo_mask, 0], coords[calo_mask, 1], coords[calo_mask, 2], 
+                            c=colors[calo_mask], s=marker_size, alpha=0.6, marker='.', label='Calo')
+            if tracker_mask.any():
+                ax1.scatter(coords[tracker_mask, 0], coords[tracker_mask, 1], coords[tracker_mask, 2], 
+                            c=colors[tracker_mask], s=marker_size * 2, alpha=0.8, marker='^', label='Tracker')
+            
             ax1.set_title(f"3D Hit Coordinates (Event {event_data['event_id']})\n"
                           f"Colored by DBSCAN on Embeddings")
             ax1.set_xlabel("X")
             ax1.set_ylabel("Y")
             ax1.set_zlabel("Z")
+            ax1.legend(loc='upper right')
             
             # Plot 2: 2D UMAP Projection
-            ax2.scatter(umap_proj[:, 0], umap_proj[:, 1],
-                        c=colors, s=marker_size, alpha=0.6)
+            if calo_mask.any():
+                ax2.scatter(umap_proj[calo_mask, 0], umap_proj[calo_mask, 1],
+                            c=colors[calo_mask], s=marker_size, alpha=0.6, marker='.')
+            if tracker_mask.any():
+                ax2.scatter(umap_proj[tracker_mask, 0], umap_proj[tracker_mask, 1],
+                            c=colors[tracker_mask], s=marker_size * 2, alpha=0.8, marker='^')
+            
             ax2.set_title(f"2D UMAP Embedding Projection\n"
                           f"({n_clusters} DBSCAN clusters)")
             ax2.set_xlabel("UMAP Dimension 1")
@@ -338,7 +389,7 @@ class PandaTrainer:
             plt.close()
             print(f"Saved extended embedding visualization to {save_path}")
 
-    def train_step(self, batch, m):
+    def train_step(self, batch, m, temp_t):
         self.optimizer.zero_grad()
         
         # 1. Teacher outputs for global views (unmasked)
@@ -347,12 +398,25 @@ class PandaTrainer:
             for g_view in batch["global_views"]:
                 for k in g_view.keys(): g_view[k] = g_view[k].to(self.device)
                 # Teacher temperature: scheduled from 0.04 to 0.07 in paper
-                # For simplicity, we use fixed or can be scheduled
                 t_point = self.teacher_backbone(g_view, upcast=True)
                 t_logits = self.teacher_head(t_point.feat)
+                
+                # Apply centering (DINO approach)
+                t_logits_centered = t_logits - self.center
+                
                 # Sinkhorn-Knopp centering
-                target = sinkhorn_knopp(t_logits)
+                target = sinkhorn_knopp(t_logits_centered, temp_t)
                 teacher_targets.append(target)
+                
+                # Update center running mean
+                # Using a slightly higher momentum (0.9) to prevent sudden jumps
+                self.center = self.center * 0.9 + t_logits.mean(dim=0, keepdim=True) * 0.1
+                
+                # Track prototype usage (hard assignment)
+                with torch.no_grad():
+                    assignments = target.argmax(dim=-1)
+                    counts = torch.bincount(assignments, minlength=self.num_prototypes)
+                    self.prototype_counts += counts
                 
         # 2. Student outputs for all views
         loss = 0
@@ -372,7 +436,10 @@ class PandaTrainer:
                 temp_s = 0.1
                 # Point-wise match for same view (masked student vs unmasked teacher)
                 if i == j:
-                    l = -torch.sum(t_target * F.log_softmax(s_logits / temp_s, dim=-1), dim=-1).mean()
+                    # MIM Loss: Only backpropagate through masked points
+                    mask = g_view["mask"]
+                    point_loss = -torch.sum(t_target * F.log_softmax(s_logits / temp_s, dim=-1), dim=-1)
+                    l = point_loss[mask].mean() if mask.any() else torch.tensor(0.0, device=self.device, requires_grad=True)
                 # Global-mean match for cross-view (different crops)
                 else:
                     l = -torch.sum(t_target.mean(dim=0) * F.log_softmax(s_logits / temp_s, dim=-1), dim=-1).mean()
@@ -388,11 +455,7 @@ class PandaTrainer:
             for t_target in teacher_targets:
                 temp_s = 0.1
                 # In paper, local views are matched to global teacher views
-                # We need to map local view points to global view points if we want exact matching,
-                # but typically in self-distillation, we just match distributions.
-                # However, PANDA matches corresponding unmasked regions.
-                # For simplicity here, we match the mean distribution or random sample
-                # or just use the whole target. DINO matches local views to global views.
+                # DINO matches local views to global views using the mean distribution
                 l = -torch.sum(t_target.mean(dim=0) * F.log_softmax(s_logits / temp_s, dim=-1), dim=-1).mean()
                 loss += l
                 n_loss_terms += 1
@@ -426,16 +489,47 @@ class PandaTrainer:
             pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
             for i, batch in enumerate(pbar):
                 # EMA momentum schedule
-                m = 0.996 + (1.0 - 0.996) * (n_steps / (self.args.epochs * len(base_ds) / self.args.batch_size + 1e-6))
+                total_expected_steps = self.args.epochs * (len(base_ds) // self.args.batch_size)
+                m = 0.996 + (1.0 - 0.996) * (n_steps / (total_expected_steps + 1e-6))
                 m = min(m, 0.9999)
                 
-                loss = self.train_step(batch, m)
+                # Teacher temperature schedule (first 10% of training)
+                # Range 0.04 -> 0.07 (Teacher is SHARPER than student at 0.1)
+                warmup_limit = 0.10 * total_expected_steps
+                if n_steps < warmup_limit:
+                    temp_t = 0.04 + (n_steps / warmup_limit) * (0.07 - 0.04)
+                else:
+                    temp_t = 0.07
+                
+                # Difficulty scheduling for masking (first 5% of training)
+                # Paper: mask_ratio 0.5 -> 0.9, patch_size 2.1cm -> 15cm
+                # Mapping: 7 voxels -> 0.007, 50 voxels -> 0.050
+                if n_steps < warmup_limit:
+                    alpha = n_steps / warmup_limit
+                    wrapper_ds.mask_ratio = 0.5 + alpha * (0.9 - 0.5)
+                    wrapper_ds.patch_size = 0.007 + alpha * (0.05 - 0.007)
+                else:
+                    wrapper_ds.mask_ratio = 0.9
+                    wrapper_ds.patch_size = 0.050
+                
+                loss = self.train_step(batch, m, temp_t)
                 n_steps += 1
                 
                 if i % 10 == 0:
-                    pbar.set_postfix(loss=f"{loss:.4f}", m=f"{m:.4f}")
+                    pbar.set_postfix(loss=f"{loss:.4f}", m=f"{m:.4f}", mask=f"{wrapper_ds.mask_ratio:.2f}", temp_t=f"{temp_t:.3f}")
                     self.writer.add_scalar("Train/Loss", loss, n_steps)
                     self.writer.add_scalar("Train/EMA_Momentum", m, n_steps)
+                    self.writer.add_scalar("Train/Teacher_Temp", temp_t, n_steps)
+                    self.writer.add_scalar("Train/Mask_Ratio", wrapper_ds.mask_ratio, n_steps)
+                    self.writer.add_scalar("Train/Patch_Size", wrapper_ds.patch_size, n_steps)
+                    
+                    # Log prototype usage stats
+                    usage_mean = self.prototype_counts.mean().item()
+                    usage_std = self.prototype_counts.std().item()
+                    self.writer.add_scalar("Prototypes/Usage_Mean", usage_mean, n_steps)
+                    self.writer.add_scalar("Prototypes/Usage_Std", usage_std, n_steps)
+                    # Reset counts for next 10 steps
+                    self.prototype_counts.zero_()
             
             # Save checkpoint
             save_path = os.path.join(self.args.output_dir, f"panda_checkpoint_epoch_{epoch+1}.pth")
@@ -455,10 +549,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_hits", type=int, default=2048)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=6)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.04)
-    parser.add_argument("--n_local_views", type=int, default=2)
+    parser.add_argument("--num_prototypes", type=int, default=512)
+    parser.add_argument("--n_local_views", type=int, default=4)
     parser.add_argument("--output_dir", type=str, default="results/panda_pretrain")
     parser.add_argument("--max_events", type=int, default=None)
     args = parser.parse_args()
