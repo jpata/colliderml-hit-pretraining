@@ -7,11 +7,10 @@ version = "0.1.0"
 
 [activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
-COLLIDERML_DATA_DIR = "/scratch/persistent/joosep/colliderml"
 PYTHONPATH = "$PIXI_PROJECT_ROOT/src:$PYTHONPATH"
 
 [feature.tallinn.activation]
-env = { SITE = "tallinn", PROFILE = ".profiles/tallinn", CORES = "1" }
+env = { SITE = "tallinn", PROFILE = ".profiles/tallinn", CORES = "1", COLLIDERML_DATA_DIR = "/local/joosep/colliderml" }
 
 [feature.local.activation]
 env = { SITE = "local", PROFILE = ".profiles/local", CORES = "1" }

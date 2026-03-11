@@ -121,10 +121,10 @@ class PatchEmbed(nn.Module):
     Patch-level tokenization following Point-MAE.
     Groups points into patches using FPS and KNN, then embeds them with a PointNet.
     """
-    def __init__(self, n_patches=64, k=32, in_chans=5, embed_dim=128):
+    def __init__(self, n_patches=64, k_neighbors=32, in_chans=5, embed_dim=128):
         super().__init__()
         self.n_patches = n_patches
-        self.k = k
+        self.k_neighbors = k_neighbors
         self.point_net = nn.Sequential(
             nn.Linear(in_chans, embed_dim),
             nn.LayerNorm(embed_dim),
@@ -150,7 +150,7 @@ class PatchEmbed(nn.Module):
         centers = index_points(xyz, fps_idx) # (B, G, 3)
         
         # 2. KNN to group points into patches
-        group_idx = knn_point(self.k, xyz, centers) # (B, G, K)
+        group_idx = knn_point(self.k_neighbors, xyz, centers) # (B, G, K)
         patches = index_points(x, group_idx) # (B, G, K, C)
         
         # 3. Local normalization (relative to center)
@@ -169,50 +169,98 @@ class PatchEmbed(nn.Module):
         
         return tokens, centers, patches, group_idx
 
-def compute_all_hit_representations(model, hits, window_size=256, overlap=128):
+from hilbert import hilbert_index_3d
+
+import time
+
+def compute_all_hit_representations(model, hits, window_size=1024, overlap=None, return_windows=False):
     """
     Computes embeddings for patches in an event.
-    Returns embeddings for patch centers.
+    Returns embeddings for patch centers and optionally the hits in each window.
+    Uses Hilbert sorting for 3D-local windows, matching the training distribution.
     """
+    if overlap is None:
+        overlap = window_size // 4
+        
     N = hits.shape[0]
-    device = next(model.parameters()).device
+    step = max(1, window_size - overlap)
+    n_windows = (N + step - 1) // step
+    print(f"\n[DEBUG] compute_all_hit_representations: N={N}, window_size={window_size}, overlap={overlap}, step={step}, n_windows={n_windows}")
     
-    # Sort hits by Z coordinate
-    z_indices = torch.argsort(hits[:, 2])
-    sorted_hits = hits[z_indices]
+    if N == 0:
+        device = next(model.parameters()).device
+        embed_dim = model.pos_embed.shape[-1]
+        res = (torch.empty((0, embed_dim), device=device), torch.empty((0, 3), device=device))
+        return res + ([],) if return_windows else res
+
+    device = hits.device
+    
+    # Sort hits by Hilbert index for spatial locality (matches training)
+    t0 = time.time()
+    coords = hits[:, :3]
+    h_indices = hilbert_index_3d(coords)
+    sorted_indices = torch.from_numpy(np.argsort(h_indices)).to(device)
+    sorted_hits = hits[sorted_indices]
+    print(f"[DEBUG] Hilbert sorting took {time.time() - t0:.4f}s")
     
     all_latents = []
     all_coords = []
+    all_windows = []
     
     step = max(1, window_size - overlap)
+    n_windows = (N + step - 1) // step
+    print(f"[DEBUG] Processing approx {n_windows} windows (step={step})")
     
     model.eval()
+    t_start = time.time()
     with torch.no_grad():
         for start in range(0, N, step):
             end = min(start + window_size, N)
             window_hits = sorted_hits[start:end]
             
             curr_size = window_hits.shape[0]
-            if curr_size < 10: continue # Skip too small windows
+            if curr_size == 0:
+                if end == N: break
+                continue
+            
+            if return_windows:
+                all_windows.append(window_hits.cpu())
             
             # Pad if window is smaller than window_size (for FPS consistency if needed)
             if curr_size < window_size:
-                padding = window_hits[torch.randint(0, curr_size, (window_size - curr_size,))]
+                idx = torch.randint(0, curr_size, (window_size - curr_size,), device=device)
+                padding = window_hits[idx]
                 input_hits = torch.cat([window_hits, padding], dim=0).unsqueeze(0)
             else:
                 input_hits = window_hits.unsqueeze(0)
                 
             # Patch mode: returns (B, G, E), (B, G, 3), (B, G, K, C), (B, G, K)
+            # input_hits is (1, window_size, 5)
             tokens, centers, _, _ = model.patch_embed(input_hits)
             tokens = tokens + model.pos_embed[:, :tokens.shape[1], :]
             latent = model.encoder(tokens)
+            
             all_latents.append(latent[0].cpu())
             all_coords.append(centers[0].cpu())
             
+            if (start // step) % 10 == 0:
+                print(f"[DEBUG] Window {start // step}/{n_windows}: input_hits={input_hits.shape}, tokens={tokens.shape}")
+            
             if end == N: break
                 
+    print(f"[DEBUG] Window processing took {time.time() - t_start:.4f}s total")
+    
+    if not all_latents:
+        embed_dim = model.pos_embed.shape[-1]
+        res = (torch.empty((0, embed_dim)), torch.empty((0, 3)))
+        return res + ([],) if return_windows else res
+
     final_latents = torch.cat(all_latents, dim=0)
     final_coords = torch.cat(all_coords, dim=0)
+    print(f"[DEBUG] Final representations: latents={final_latents.shape}, coords={final_coords.shape}")
+    
+    if return_windows:
+        return final_latents, final_coords, all_windows
     return final_latents, final_coords
 
 def compute_collapse_metrics(masked_preds, decoded, mask, targets=None):
@@ -412,7 +460,7 @@ def plot_fidelity_vs_density(density_stats, epoch, output_dir, writer=None):
         writer.add_figure(f"Validation/Fidelity vs Density", fig, global_step=epoch)
     plt.close()
 
-def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, writer=None):
+def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, window_size=1024, writer=None):
     print(f"  - Starting visualize_embeddings for {n_events} events")
     model.eval()
     device = next(model.parameters()).device
@@ -423,11 +471,11 @@ def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, wri
         all_hits_np = event_data["all_hits"]
         all_hits = torch.from_numpy(all_hits_np).to(device)
         
-        if all_hits.shape[0] < 10: continue
+        if all_hits.shape[0] == 0: continue
         
         # Compute embeddings
         print(f"    - Computing representations for event {i}")
-        embeddings, coords = compute_all_hit_representations(model, all_hits, window_size=256)
+        embeddings, coords = compute_all_hit_representations(model, all_hits, window_size=window_size)
         embeddings_np = embeddings.numpy()
         coords_np = coords.numpy()
         
@@ -460,7 +508,7 @@ def visualize_embeddings(model, full_dataset, epoch, output_dir, n_events=1, wri
         plt.close()
 
 
-def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, mask_ratio=0.5, writer=None):
+def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=5, mask_ratio=0.5, writer=None):
     """
     Visualize ground truth vs model reconstruction for a few events.
     """
@@ -494,9 +542,18 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
             recon_np = reconstructed[0].cpu().numpy() # (G, K, D)
             mask_np = mask[0].cpu().numpy().astype(bool) # (G,)
             
+            # Calculate common axis ranges for consistency
+            all_pts = np.concatenate([hits_np[:, :, :3].reshape(-1, 3), recon_np[:, :, :3].reshape(-1, 3)], axis=0)
+            mins = all_pts.min(axis=0)
+            maxs = all_pts.max(axis=0)
+            
             fig = plt.figure(figsize=(16, 8))
-            ax1 = fig.add_subplot(121)
-            ax2 = fig.add_subplot(122)
+            n_total = hits_np.shape[0] * hits_np.shape[1]
+            n_masked = mask_np.sum() * hits_np.shape[1]
+            fig.suptitle(f"Epoch {epoch+1} - Event {i} (Total Hits: {n_total}, Masked: {n_masked})")
+            
+            ax1 = fig.add_subplot(121, projection='3d')
+            ax2 = fig.add_subplot(122, projection='3d')
             
             cmap = plt.get_cmap('tab20')
             for g in range(hits_np.shape[0]):
@@ -505,19 +562,23 @@ def visualize_reconstruction(model, dataloader, epoch, output_dir, n_events=2, m
                 color = cmap(g % 20)
                 if mask_np[g]:
                     # Masked patches: 'x' for Ground Truth, 'x' for Reconstruction
-                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], color=color, s=30, marker='x')
-                    ax2.scatter(p_recon[:, 0], p_recon[:, 1], color=color, s=30, marker='x')
+                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], color=color, s=30, marker='x')
+                    ax2.scatter(p_recon[:, 0], p_recon[:, 1], p_recon[:, 2], color=color, s=30, marker='x')
                 else:
                     # Visible patches: '.' for both
-                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], color=color, s=15, marker='.')
-                    ax2.scatter(p_hits[:, 0], p_hits[:, 1], color=color, s=15, marker='.')
+                    ax1.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], color=color, s=15, marker='.')
+                    ax2.scatter(p_hits[:, 0], p_hits[:, 1], p_hits[:, 2], color=color, s=15, marker='.')
             
+            for ax in [ax1, ax2]:
+                ax.set_xlim(-0.2, 0.2)
+                ax.set_ylim(-0.2, 0.2)
+                ax.set_zlim(-0.2, 0.2)
+                ax.set_xlabel('Local X')
+                ax.set_ylabel('Local Y')
+                ax.set_zlabel('Local Z')
+
             ax1.set_title("Ground Truth (x=Masked, .=Visible)")
-            ax1.set_xlabel('Local X')
-            ax1.set_ylabel('Local Y')
             ax2.set_title("Reconstruction (x=Pred, .=Visible)")
-            ax2.set_xlabel('Local X')
-            ax2.set_ylabel('Local Y')
             print(f"    - Saving reconstruction plot for batch {i}")
             plt.savefig(os.path.join(output_dir, f"reconstruction_epoch_{epoch+1}_ev{i}.png"))
             if writer:
@@ -548,14 +609,14 @@ def compute_chamfer_loss(preds, targets, return_components=False):
 
 class MaskedPointModel(nn.Module):
     def __init__(self, embed_dim=128, decoder_embed_dim=64, nhead=8, 
-                 encoder_layers=6, decoder_layers=4, n_patches=64, k=32, output_dim=11):
+                 encoder_layers=6, decoder_layers=4, n_patches=64, k_neighbors=32, output_dim=11):
         super().__init__()
         self.n_patches = n_patches
-        self.k = k
+        self.k_neighbors = k_neighbors
         self.output_dim = output_dim
         
         # --- Encoder ---
-        self.patch_embed = PatchEmbed(n_patches=n_patches, k=k, in_chans=5, embed_dim=embed_dim)
+        self.patch_embed = PatchEmbed(n_patches=n_patches, k_neighbors=k_neighbors, in_chans=5, embed_dim=embed_dim)
         # Use learned absolute pos_embed as fallback/additional signal
         self.pos_embed = nn.Parameter(torch.randn(1, n_patches, embed_dim) * 0.02)
         
@@ -589,9 +650,9 @@ class MaskedPointModel(nn.Module):
         
         # Folding Seed for diversity within patches
         # Each point in a patch has its own learnable seed
-        self.folding_seed = nn.Parameter(torch.randn(1, k, 16))
+        self.folding_seed = nn.Parameter(torch.randn(1, k_neighbors, 16))
         # Spatial grid prior (3D) to provide a geometric baseline
-        self.register_buffer('spatial_grid', torch.randn(1, k, 3))
+        self.register_buffer('spatial_grid', torch.randn(1, k_neighbors, 3))
         
         # Reconstruction head: Processes each point separately
         self.reconstructor = nn.Sequential(
@@ -667,9 +728,9 @@ class MaskedPointModel(nn.Module):
         # 3. Folding Reconstruction
         B, L, D_total = decoded.shape
         # seed: (1, K, 16) -> (B, L, K, 16)
-        seed = self.folding_seed.view(1, 1, self.k, 16).expand(B, L, self.k, 16)
+        seed = self.folding_seed.view(1, 1, self.k_neighbors, 16).expand(B, L, self.k_neighbors, 16)
         # spatial_grid: (1, K, 3) -> (B, L, K, 3)
-        grid = self.spatial_grid.view(1, 1, self.k, 3).expand(B, L, self.k, 3)
+        grid = self.spatial_grid.view(1, 1, self.k_neighbors, 3).expand(B, L, self.k_neighbors, 3)
         
         # Add stochastic noise during training to force the MLP to use the seed
         if self.training:
@@ -678,12 +739,12 @@ class MaskedPointModel(nn.Module):
             grid = grid + torch.randn_like(grid) * 0.05
 
         # decoded: (B, L, D_total) -> (B, L, K, D_total)
-        decoded_expanded = decoded.unsqueeze(2).expand(B, L, self.k, D_total)
+        decoded_expanded = decoded.unsqueeze(2).expand(B, L, self.k_neighbors, D_total)
         
         combined = torch.cat([decoded_expanded, seed, grid], dim=-1) # (B, L, K, D_total + 16 + 3)
         
         reconstructed = self.reconstructor(combined.reshape(-1, D_total + 16 + 3))
-        reconstructed = reconstructed.view(B, L, self.k, self.output_dim)
+        reconstructed = reconstructed.view(B, L, self.k_neighbors, self.output_dim)
             
         return reconstructed, mask, decoded, centers, group_idx
 
@@ -722,18 +783,27 @@ def compute_density(hits, radii=[0.01, 0.02, 0.05], return_all=False):
     
     return torch.stack(density_features, dim=-1).mean(dim=-1)
 
-def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4, 
+from model_config import get_model_config
+
+def train(num_hits=None, embed_dim=None, max_events=None, epochs=1, batch_size=4, 
           output_dir="results", output_loss=None, output_checkpoint=None, use_neighborhood=True, 
-          mask_ratio=0.5, lr=1e-4, n_patches=64, k_neighbors=32,
+          mask_ratio=0.5, lr=1e-4, n_patches=None, k_neighbors=None,
           train_dataset_name="ttbar", val_dataset_name="ggf"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Start the monitoring thread
-    monitor_thread = threading.Thread(target=log_cpu_usage, args=(30,), daemon=True)
-    monitor_thread.start()
+    # Load central config
+    config = get_model_config()
+    # Override with arguments if provided
+    if num_hits is not None: config["num_hits"] = num_hits
+    if embed_dim is not None: config["embed_dim"] = embed_dim
+    if n_patches is not None: config["n_patches"] = n_patches
+    if k_neighbors is not None: config["k_neighbors"] = k_neighbors
     
-    print(f"Config: num_hits={num_hits}, embed_dim={embed_dim}, patches={n_patches}x{k_neighbors}, mask_ratio={mask_ratio}, lr={lr}")
+    # Extract num_hits from config for dataset initialization
+    num_hits = config.pop("num_hits")
+    
+    print(f"Config: num_hits={num_hits}, embed_dim={config['embed_dim']}, patches={config['n_patches']}x{config['k_neighbors']}, mask_ratio={mask_ratio}, lr={lr}")
     print(f"Datasets: train={train_dataset_name}, val={val_dataset_name}")
     
     os.makedirs(output_dir, exist_ok=True)
@@ -741,7 +811,7 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
     
     # Initialize/Clear metrics log
     with open(os.path.join(output_dir, "metrics.log"), "w") as f:
-        f.write(f"Training session started. Config: hits={num_hits}, embed={embed_dim}, ratio={mask_ratio}\n")
+        f.write(f"Training session started. Config: hits={num_hits}, embed={config['embed_dim']}, ratio={mask_ratio}\n")
         f.write(f"Datasets: train={train_dataset_name}, val={val_dataset_name}\n\n")
 
     # Dataset Selection
@@ -765,19 +835,17 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         val_dataset, 
         batch_size=batch_size, 
         num_workers=0,
-        pin_memory=True
+        pin_memory=True,
     )
     
-    output_dim = 5 + 6
-    model = MaskedPointModel(
-        embed_dim=embed_dim, 
-        output_dim=output_dim, 
-        n_patches=n_patches, 
-        k=k_neighbors
-    ).to(device)
+    model = MaskedPointModel(**config).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    # Prepare checkpoint path
+    ckpt_name = output_checkpoint if output_checkpoint else f"checkpoint_h{num_hits}_patches.pth"
+    save_path = os.path.join(output_dir, ckpt_name)
 
     # Training Loop
     epoch_losses = []
@@ -870,6 +938,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
                 v_in=var_within.item(), 
                 v_out=var_across.item()
             )
+            # Save checkpoint every iteration
+            torch.save(model.state_dict(), save_path)
 
         scheduler.step()
         num_batches = i + 1
@@ -996,19 +1066,15 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
         epoch_losses.append((epoch + 1, avg_train_loss, avg_val_loss, 0, 0)) 
 
         print(f"Visualizing embeddings...")
-        visualize_embeddings(model, train_dataset, epoch, output_dir, n_events=1, writer=writer)
+        visualize_embeddings(model, train_dataset, epoch, output_dir, n_events=1, window_size=num_hits, writer=writer)
         print(f"Visualizing reconstruction...")
-        visualize_reconstruction(model, val_dataloader, epoch, output_dir, n_events=2, mask_ratio=curr_mask_ratio, writer=writer)
+        visualize_reconstruction(model, val_dataloader, epoch, output_dir, n_events=5, mask_ratio=curr_mask_ratio, writer=writer)
         print(f"Plotting fidelity vs density...")
         plot_fidelity_vs_density(density_stats, epoch, output_dir, writer=writer)
         writer.flush()
 
 
-    # Save model
-    ckpt_name = output_checkpoint if output_checkpoint else f"checkpoint_h{num_hits}_patches.pth"
-    save_path = os.path.join(output_dir, ckpt_name)
-    torch.save(model.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
+    print(f"Final model saved to {save_path}")
     writer.close()
 
     if output_loss:
@@ -1022,8 +1088,8 @@ def train(num_hits=256, embed_dim=16, max_events=None, epochs=1, batch_size=4,
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_hits", type=int, default=2048)
-    parser.add_argument("--embed_dim", type=int, default=128)
+    parser.add_argument("--num_hits", type=int, default=None)
+    parser.add_argument("--embed_dim", type=int, default=None)
     parser.add_argument("--max_events", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -1033,10 +1099,10 @@ if __name__ == "__main__":
     parser.add_argument("--neighborhood", type=str, choices=["True", "False"], default="True")
     parser.add_argument("--mask_ratio", type=float, default=0.5)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--n_patches", type=int, default=128)
-    parser.add_argument("--k_neighbors", type=int, default=64)
+    parser.add_argument("--n_patches", type=int, default=None)
+    parser.add_argument("--k_neighbors", type=int, default=None)
     parser.add_argument("--train_dataset", type=str, default="ttbar")
-    parser.add_argument("--val_dataset", type=str, default="ttbar")
+    parser.add_argument("--val_dataset", type=str, default="ggf")
     args = parser.parse_args()
     
     use_neighborhood = args.neighborhood == "True"
