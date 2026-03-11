@@ -389,6 +389,63 @@ class PandaTrainer:
             plt.close()
             print(f"Saved extended embedding visualization to {save_path}")
 
+    def visualize_batch_views(self, batch, n_steps):
+        """
+        Visualize the first sample in a batch for debugging views and masks.
+        """
+        # We'll visualize the first sample in the batch
+        # PTv3 collation uses cumulative offsets
+        g0_offset = batch["global_views"][0]["offset"][0].item()
+        
+        n_globals = len(batch["global_views"])
+        n_locals = len(batch["local_views"])
+        
+        fig = plt.figure(figsize=(5 * max(n_globals, n_locals), 10))
+        
+        # 1. Plot Global Views (top row)
+        for i in range(n_globals):
+            ax = fig.add_subplot(2, max(n_globals, n_locals), i + 1, projection='3d')
+            gv = batch["global_views"][i]
+            mask = batch["global_masks"][i]
+            
+            # Extract first sample points
+            coords = gv["coord"][:g0_offset].cpu().numpy()
+            m = mask[:g0_offset].cpu().numpy()
+            
+            # Unmasked points (Blue)
+            unmasked = coords[~m]
+            if len(unmasked) > 0:
+                ax.scatter(unmasked[:, 0], unmasked[:, 1], unmasked[:, 2], 
+                           c='blue', s=2, alpha=0.5, label='Visible')
+            
+            # Masked points (Red)
+            masked = coords[m]
+            if len(masked) > 0:
+                ax.scatter(masked[:, 0], masked[:, 1], masked[:, 2], 
+                           c='red', s=5, alpha=0.2, label='Masked')
+            
+            ax.set_title(f"Global View {i+1}\n(Masked: {m.mean():.1%})")
+            if i == 0: ax.legend()
+
+        # 2. Plot Local Views (bottom row)
+        for i in range(n_locals):
+            ax = fig.add_subplot(2, max(n_globals, n_locals), max(n_globals, n_locals) + i + 1, projection='3d')
+            lv = batch["local_views"][i]
+            l_offset = lv["offset"][0].item()
+            
+            coords = lv["coord"][:l_offset].cpu().numpy()
+            
+            ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2], c='green', s=2, alpha=0.6)
+            ax.set_title(f"Local View {i+1}")
+
+        plt.suptitle(f"Batch Multi-View Visualization (Step {n_steps})")
+        plt.tight_layout()
+        
+        save_path = os.path.join(self.args.output_dir, f"batch_views_step_{n_steps}.png")
+        plt.savefig(save_path)
+        plt.close()
+        print(f"Saved batch view visualization to {save_path}")
+
     def train_step(self, batch, m, temp_t):
         self.optimizer.zero_grad()
         
@@ -513,6 +570,11 @@ class PandaTrainer:
                     wrapper_ds.patch_size = 0.050
                 
                 loss = self.train_step(batch, m, temp_t)
+                
+                # Debug Visualization of views
+                if n_steps % 100 == 0:
+                    self.visualize_batch_views(batch, n_steps)
+
                 n_steps += 1
                 
                 if i % 10 == 0:
