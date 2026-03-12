@@ -179,7 +179,7 @@ class Sonata(PointModule):
             return torch.zeros(0, dtype=torch.bool, device=coord.device)
         batch = offset2batch(offset)
         # Simplify: unique grid patches
-        grid_coord = (coord // mask_size).int()
+        grid_coord = (coord // mask_size).long()
         grid_coord = torch.cat([batch.unsqueeze(-1), grid_coord], dim=-1)
         unique, point_cluster = torch.unique(grid_coord, dim=0, return_inverse=True)
         patch_num = unique.shape[0]
