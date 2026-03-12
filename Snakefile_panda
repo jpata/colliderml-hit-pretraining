@@ -1,0 +1,32 @@
+NUM_HITS_LIST = [512, 1024, 2048, 4096, 8192]
+EPOCHS = 5
+BATCH_SIZE = 4
+MAX_EVENTS = 1000
+
+rule all:
+    input:
+        expand("results/panda_hits_{num_hits}/checkpoint_{epochs}.pth", num_hits=NUM_HITS_LIST, epochs=[EPOCHS])
+
+rule train_panda:
+    output:
+        checkpoint = "results/panda_hits_{num_hits}/checkpoint_{epochs}.pth"
+    params:
+        output_dir = "results/panda_hits_{num_hits}",
+        epochs = EPOCHS,
+        batch_size = BATCH_SIZE,
+        max_events = MAX_EVENTS
+    resources:
+        slurm_partition="gpu",
+        gres="gpu:l40:1",
+        mem_mb=32000,
+        runtime=600,
+        cpus_per_task=8
+    shell:
+        """
+        python scripts/train_panda.py \
+            --num_hits {wildcards.num_hits} \
+            --epochs {params.epochs} \
+            --batch_size {params.batch_size} \
+            --max_events {params.max_events} \
+            --output_dir {params.output_dir}
+        """
