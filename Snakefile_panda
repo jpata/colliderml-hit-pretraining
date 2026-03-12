@@ -1,5 +1,5 @@
 NUM_HITS_LIST = [512, 1024, 2048, 4096, 8192]
-EPOCHS = 5
+EPOCHS = 20
 BATCH_SIZE = 4
 MAX_EVENTS = 1000
 
@@ -18,11 +18,15 @@ rule train_panda:
     resources:
         slurm_partition="gpu",
         gres="gpu:l40:1",
-        mem_mb=32000,
+        mem_mb=30000,
         runtime=600,
         cpus_per_task=8
     shell:
         """
+        env
+        nvidia-smi
+        python -c "import torch;print('torch', torch.__version__)"
+        python -c "import torch_scatter;print('torch_scatter', torch_scatter.__version__)"
         python scripts/train_panda.py \
             --num_hits {wildcards.num_hits} \
             --epochs {params.epochs} \
