@@ -363,7 +363,8 @@ class PandaTrainer:
         
         # head_in_channels = 32 + 64 + 128 + 256 + 512 = 992
         self.model = Sonata(backbone_config, head_in_channels=992, 
-                            head_num_prototypes=args.num_prototypes, 
+                            head_num_prototypes=args.num_prototypes,
+                            num_global_view=args.n_global_views,
                             num_local_view=args.n_local_views).to(self.device)
         
         self.optimizer = optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -411,9 +412,126 @@ class PandaTrainer:
         plt.savefig(os.path.join(self.args.output_dir, f"viz_epoch_{epoch+1}.png"))
         plt.close()
 
+    @torch.no_grad()
+    def visualize_batch_views(self, batch, n_steps):
+        """Visualize how local views are cropped from the global views."""
+        self.model.eval()
+        # Extract first event's data from the collated batch
+        n_global = self.args.n_global_views
+        n_local = self.args.n_local_views
+        
+        g_offset = batch["global"]["offset"]
+        l_offset = batch["local"]["offset"]
+        
+        # Get hits for the first event
+        g_end = g_offset[n_global - 1].item()
+        l_end = l_offset[n_local - 1].item()
+        
+        g_coords = batch["global"]["origin_coord"][:g_end].cpu().numpy()
+        l_coords = batch["local"]["origin_coord"][:l_end].cpu().numpy()
+        
+        # Split into individual views
+        g_views_coords = []
+        start = 0
+        for i in range(n_global):
+            end = g_offset[i].item()
+            g_views_coords.append(batch["global"]["origin_coord"][start:end].cpu().numpy())
+            start = end
+            
+        l_views_coords = []
+        start = 0
+        for i in range(n_local):
+            end = l_offset[i].item()
+            l_views_coords.append(batch["local"]["origin_coord"][start:end].cpu().numpy())
+            start = end
+
+        fig = plt.figure(figsize=(10, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Plot all global hits in light grey for context
+        ax.scatter(g_coords[:, 0], g_coords[:, 1], g_coords[:, 2], 
+                   c='lightgrey', s=1, alpha=0.3, label='Global Context')
+        
+        colors = plt.cm.tab10(np.linspace(0, 1, n_local))
+        
+        # Helper to draw wireframe cuboid
+        def draw_cuboid(ax, points, color, label=None):
+            if len(points) == 0: return
+            min_p = points.min(axis=0)
+            max_p = points.max(axis=0)
+            x = [min_p[0], max_p[0]]
+            y = [min_p[1], max_p[1]]
+            z = [min_p[2], max_p[2]]
+            import itertools
+            vertices = list(itertools.product(x, y, z))
+            edges = [(0,1), (0,2), (0,4), (1,3), (1,5), (2,3), (2,6), (3,7), (4,5), (4,6), (5,7), (6,7)]
+            for i, (start, end) in enumerate(edges):
+                ax.plot3D(*zip(vertices[start], vertices[end]), color=color, 
+                          linewidth=1.5, alpha=0.8, label=label if i == 0 else "")
+
+        # Plot local views and their bounding boxes
+        for i, l_view in enumerate(l_views_coords):
+            if len(l_view) == 0: continue
+            color = colors[i]
+            ax.scatter(l_view[:, 0], l_view[:, 1], l_view[:, 2], 
+                       color=color, s=5, alpha=0.6)
+            draw_cuboid(ax, l_view, color, label=f"Local View {i}")
+            
+            # Add marker label at the center of the local view
+            center = l_view.mean(axis=0)
+            ax.text(center[0], center[1], center[2], f"L{i}", color="black", 
+                    fontsize=10, fontweight="bold", bbox=dict(facecolor="white", alpha=0.5, edgecolor="none"))
+
+        # Add marker labels for global views
+        for i, g_view in enumerate(g_views_coords):
+            if len(g_view) == 0: continue
+            center = g_view.mean(axis=0)
+            ax.text(center[0], center[1], center[2], f"G{i}", color="darkred", 
+                    fontsize=10, fontweight="bold", alpha=0.8)
+
+        ax.set_title(f"Batch View Visualization - Step {n_steps}")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.legend(loc="upper right", bbox_to_anchor=(1.15, 1.1))
+        
+        save_path = os.path.join(self.args.output_dir, f"batch_viz_step_{n_steps}.png")
+        plt.savefig(save_path, bbox_inches='tight')
+        plt.close()
+
+        # Save individual global-local pairs
+        step_dir = os.path.join(self.args.output_dir, f"step_{n_steps}_pairs")
+        os.makedirs(step_dir, exist_ok=True)
+        g_principal = g_views_coords[0]
+        
+        for i, l_view in enumerate(l_views_coords):
+            if len(l_view) == 0: continue
+            fig_p = plt.figure(figsize=(8, 8))
+            ax_p = fig_p.add_subplot(111, projection='3d')
+            
+            # Plot principal global view in light grey
+            ax_p.scatter(g_principal[:, 0], g_principal[:, 1], g_principal[:, 2], 
+                         c='lightgrey', s=2, alpha=0.3, label='Principal Global (G0)')
+            
+            # Plot the specific local view
+            color = colors[i]
+            ax_p.scatter(l_view[:, 0], l_view[:, 1], l_view[:, 2], 
+                         color=color, s=10, alpha=0.8, label=f'Local View {i}')
+            
+            draw_cuboid(ax_p, l_view, color)
+            
+            ax_p.set_title(f"Global-Local Pair: G0 - L{i} (Step {n_steps})")
+            ax_p.set_xlabel("X")
+            ax_p.set_ylabel("Y")
+            ax_p.set_zlabel("Z")
+            ax_p.legend()
+            
+            plt.savefig(os.path.join(step_dir, f"pair_g0_l{i}.png"), bbox_inches='tight')
+            plt.close()
+
     def run(self):
         base_ds = NeighborhoodCalorimeterDataset(num_hits=self.args.num_hits, max_events=self.args.max_events, verbose=False)
-        wrapper_ds = MultiViewDatasetWrapper(base_ds, n_local_views=self.args.n_local_views)
+        wrapper_ds = MultiViewDatasetWrapper(base_ds, n_global_views=self.args.n_global_views, n_local_views=self.args.n_local_views)
         dataloader = DataLoader(wrapper_ds, batch_size=self.args.batch_size, shuffle=False, 
                                 num_workers=4, collate_fn=panda_collate_fn, persistent_workers=True)
         
@@ -446,6 +564,9 @@ class PandaTrainer:
                     "grid_size": batch["grid_size"].to(self.device)
                 }
                 
+                if n_steps % self.args.viz_batch_freq == 0:
+                    self.visualize_batch_views(batch, n_steps)
+
                 out = self.model(data_dict, mask_size=m_size, mask_ratio=m_ratio, teacher_temp=t_temp)
                 out["loss"].backward()
                 self.optimizer.step()
@@ -487,7 +608,9 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--num_prototypes", type=int, default=4096)
+    parser.add_argument("--n_global_views", type=int, default=2)
     parser.add_argument("--n_local_views", type=int, default=6)
+    parser.add_argument("--viz_batch_freq", type=int, default=100)
     parser.add_argument("--output_dir", type=str, default="results/panda_pretrain_sonata")
     parser.add_argument("--max_events", type=int, default=None)
     args = parser.parse_args()
