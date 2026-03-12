@@ -105,10 +105,13 @@ class OnlineCluster(nn.Module):
             trunc_normal_(m.weight, std=0.02)
             if m.bias is not None: nn.init.constant_(m.bias, 0)
 
-    def forward(self, feat):
+    def forward(self, feat, return_embed=False):
         feat = self.mlp(feat)
         feat = F.normalize(feat, dim=-1, p=2)
-        return self.prototype(feat)
+        logits = self.prototype(feat)
+        if return_embed:
+            return logits, feat
+        return logits
 
 class Sonata(PointModule):
     def __init__(self, backbone_config, head_in_channels, head_num_prototypes=4096, 
@@ -179,7 +182,7 @@ class Sonata(PointModule):
         with torch.no_grad():
             t_point = self.teacher_backbone(global_point, upcast=False)
             t_point = self.up_cast(t_point)
-            t_logits = self.teacher_head(t_point.feat)
+            t_logits, t_embed = self.teacher_head(t_point.feat, return_embed=True)
             t_target = self.sinkhorn_knopp(t_logits, teacher_temp)
 
         # 3. Student Forward (Global with Masking)
@@ -234,11 +237,12 @@ class Sonata(PointModule):
             "student_entropy": student_entropy,
             "kl_divergence": kl_div,
             "t_target": t_target,
-            "s_g_logits": s_g_logits
+            "s_g_logits": s_g_logits,
+            "t_embed": t_embed
         }
 
     @torch.no_grad()
-    def track_prototype_usage(self, t_target):
+    def track_prototype_usage(self, t_target, t_embed=None):
         assignments = t_target.argmax(dim=-1)
         num_prototypes = self.teacher_head.prototype.weight_v.shape[0]
         counts = torch.bincount(assignments, minlength=num_prototypes)
@@ -247,11 +251,21 @@ class Sonata(PointModule):
         # Per-prototype assignment entropy
         prob_usage = counts.float() / (counts.sum() + 1e-12)
         usage_entropy = -torch.sum(prob_usage * torch.log(prob_usage + 1e-12)).item()
-        return {
+        
+        stats = {
             "used_prototypes": used_prototypes,
             "usage_ratio": usage_ratio,
             "usage_entropy": usage_entropy
         }
+
+        if t_embed is not None:
+            # Cluster cohesion: average cosine similarity between points and their assigned prototype
+            prototypes = self.teacher_head.prototype.weight
+            assigned_prototypes = prototypes[assignments]
+            cohesion = torch.sum(t_embed * assigned_prototypes, dim=-1).mean().item()
+            stats["cohesion"] = cohesion
+            
+        return stats
 
 # --- Dataset and Collate ---
 class MultiViewDatasetWrapper(IterableDataset):
@@ -439,11 +453,12 @@ class PandaTrainer:
                 
                 n_steps += 1
                 if n_steps % 10 == 0:
-                    usage_stats = self.model.track_prototype_usage(out["t_target"])
+                    usage_stats = self.model.track_prototype_usage(out["t_target"], out.get("t_embed"))
                     
                     pbar.set_postfix(loss=f"{out['loss'].item():.4f}", 
                                      t_ent=f"{out['teacher_entropy'].item():.2f}",
-                                     used=f"{usage_stats['used_prototypes']}")
+                                     used=f"{usage_stats['used_prototypes']}",
+                                     coh=f"{usage_stats.get('cohesion', 0):.3f}")
                     
                     self.writer.add_scalar("Train/Loss", out["loss"].item(), n_steps)
                     self.writer.add_scalar("Train/Mask_Loss", out["mask_loss"].item(), n_steps)
@@ -458,6 +473,8 @@ class PandaTrainer:
                     self.writer.add_scalar("Prototypes/Used_Count", usage_stats["used_prototypes"], n_steps)
                     self.writer.add_scalar("Prototypes/Usage_Ratio", usage_stats["usage_ratio"], n_steps)
                     self.writer.add_scalar("Prototypes/Usage_Entropy", usage_stats["usage_entropy"], n_steps)
+                    if "cohesion" in usage_stats:
+                        self.writer.add_scalar("Prototypes/Cohesion", usage_stats["cohesion"], n_steps)
             
             self.visualize_embeddings(epoch)
             torch.save(self.model.state_dict(), os.path.join(self.args.output_dir, f"checkpoint_{epoch+1}.pth"))
