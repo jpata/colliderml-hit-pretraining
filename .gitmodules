@@ -1,0 +1,6 @@
+[submodule "Panda"]
+	path = Panda
+	url = https://github.com/DeepLearnPhysics/Panda.git
+[submodule "particle-imaging-models"]
+	path = particle-imaging-models
+	url = https://github.com/DeepLearnPhysics/particle-imaging-models.git
