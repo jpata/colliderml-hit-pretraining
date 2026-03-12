@@ -197,38 +197,61 @@ class Sonata(PointModule):
 
         # 5. Loss Calculation (Multi-view consistency)
         # Global Masked Loss
-        mask_loss = -torch.sum(t_target * F.log_softmax(s_g_logits / student_temp, dim=-1), dim=-1)
-        mask_loss = mask_loss[mask].mean() if mask.any() else torch.tensor(0.0, device=mask_loss.device)
+        s_g_log_probs = F.log_softmax(s_g_logits / student_temp, dim=-1)
+        mask_loss = -torch.sum(t_target * s_g_log_probs, dim=-1)
+        mask_loss_reduced = mask_loss[mask].mean() if mask.any() else torch.tensor(0.0, device=mask_loss.device)
 
         # Local Loss (match to principal global view)
         with torch.no_grad():
-            # In Sonata, local views are matched against the first (principal) global view
-            # principal_view_mask selects the first global view for each sample in the batch
-            # For batch_size=1, this is just all global points of the first view
             principal_mask = t_point.batch % self.num_global_view == 0
             t_principal_coord = t_point.origin_coord[principal_mask]
             t_principal_target = t_target[principal_mask]
-            
-            # We need to calculate the offset for the principal global views
-            # For each sample, we only take the first view
             t_principal_offset = t_point.offset[0::self.num_global_view]
             if self.num_global_view > 1:
-                # Need to adjust offsets if they were cumulative
                 t_counts = offset2bincount(t_point.offset)
                 t_principal_counts = t_counts[0::self.num_global_view]
                 t_principal_offset = torch.cumsum(t_principal_counts, dim=0)
-
-            # Match each local view to its corresponding principal global view
-            # We repeat the principal offset for each of its local views
             t_support_offset = t_principal_offset.repeat_interleave(self.num_local_view)
-            
             match_idx, _ = knn_query(1, s_l_point.origin_coord, s_l_point.offset, 
                                      t_principal_coord, t_support_offset)
             l_target = t_principal_target[match_idx.squeeze(-1)]
         
         local_loss = -torch.sum(l_target * F.log_softmax(s_l_logits / student_temp, dim=-1), dim=-1).mean()
 
-        return {"mask_loss": mask_loss, "local_loss": local_loss, "loss": 0.5 * mask_loss + 0.5 * local_loss}
+        # Monitoring quantities
+        with torch.no_grad():
+            teacher_entropy = -torch.sum(t_target * torch.log(t_target + 1e-12), dim=-1).mean()
+            s_g_probs = F.softmax(s_g_logits / student_temp, dim=-1)
+            student_entropy = -torch.sum(s_g_probs * torch.log(s_g_probs + 1e-12), dim=-1).mean()
+            # KL Divergence between teacher and student on masked points
+            kl_div = F.kl_div(s_g_log_probs[mask], t_target[mask], reduction='batchmean') if mask.any() else torch.tensor(0.0, device=mask_loss.device)
+
+        return {
+            "mask_loss": mask_loss_reduced, 
+            "local_loss": local_loss, 
+            "loss": 0.5 * mask_loss_reduced + 0.5 * local_loss,
+            "teacher_entropy": teacher_entropy,
+            "student_entropy": student_entropy,
+            "kl_divergence": kl_div,
+            "t_target": t_target,
+            "s_g_logits": s_g_logits
+        }
+
+    @torch.no_grad()
+    def track_prototype_usage(self, t_target):
+        assignments = t_target.argmax(dim=-1)
+        num_prototypes = self.teacher_head.prototype.weight_v.shape[0]
+        counts = torch.bincount(assignments, minlength=num_prototypes)
+        used_prototypes = (counts > 0).sum().item()
+        usage_ratio = used_prototypes / num_prototypes
+        # Per-prototype assignment entropy
+        prob_usage = counts.float() / (counts.sum() + 1e-12)
+        usage_entropy = -torch.sum(prob_usage * torch.log(prob_usage + 1e-12)).item()
+        return {
+            "used_prototypes": used_prototypes,
+            "usage_ratio": usage_ratio,
+            "usage_entropy": usage_entropy
+        }
 
 # --- Dataset and Collate ---
 class MultiViewDatasetWrapper(IterableDataset):
@@ -416,9 +439,25 @@ class PandaTrainer:
                 
                 n_steps += 1
                 if n_steps % 10 == 0:
-                    pbar.set_postfix(loss=f"{out['loss'].item():.4f}", m=f"{m:.4f}")
+                    usage_stats = self.model.track_prototype_usage(out["t_target"])
+                    
+                    pbar.set_postfix(loss=f"{out['loss'].item():.4f}", 
+                                     t_ent=f"{out['teacher_entropy'].item():.2f}",
+                                     used=f"{usage_stats['used_prototypes']}")
+                    
                     self.writer.add_scalar("Train/Loss", out["loss"].item(), n_steps)
+                    self.writer.add_scalar("Train/Mask_Loss", out["mask_loss"].item(), n_steps)
+                    self.writer.add_scalar("Train/Local_Loss", out["local_loss"].item(), n_steps)
+                    self.writer.add_scalar("Train/Teacher_Entropy", out["teacher_entropy"].item(), n_steps)
+                    self.writer.add_scalar("Train/Student_Entropy", out["student_entropy"].item(), n_steps)
+                    self.writer.add_scalar("Train/KL_Divergence", out["kl_divergence"].item(), n_steps)
                     self.writer.add_scalar("Params/Mask_Ratio", m_ratio, n_steps)
+                    self.writer.add_scalar("Params/Mask_Size", m_size, n_steps)
+                    self.writer.add_scalar("Params/Teacher_Temp", t_temp, n_steps)
+                    self.writer.add_scalar("Params/Momentum", m, n_steps)
+                    self.writer.add_scalar("Prototypes/Used_Count", usage_stats["used_prototypes"], n_steps)
+                    self.writer.add_scalar("Prototypes/Usage_Ratio", usage_stats["usage_ratio"], n_steps)
+                    self.writer.add_scalar("Prototypes/Usage_Entropy", usage_stats["usage_entropy"], n_steps)
             
             self.visualize_embeddings(epoch)
             torch.save(self.model.state_dict(), os.path.join(self.args.output_dir, f"checkpoint_{epoch+1}.pth"))
