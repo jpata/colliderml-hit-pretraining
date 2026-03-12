@@ -46,8 +46,11 @@ except ImportError:
 
 def knn_query(k, query, query_offset, support, support_offset):
     """Fallback KNN using torch.cdist when pointops is not available."""
-    if pointops is not None:
-        return pointops.knn_query(k, support.float(), support_offset.int(), query.float(), query_offset.int())
+    if pointops is not None and support.shape[0] > 0:
+        try:
+            return pointops.knn_query(k, support.float(), support_offset.int(), query.float(), query_offset.int())
+        except Exception as e:
+            print(f"pointops.knn_query failed: {e}, falling back to torch.cdist")
     
     indices = []
     distances = []
@@ -58,12 +61,21 @@ def knn_query(k, query, query_offset, support, support_offset):
         s_end = s_off.item()
         q_batch = query[q_start:q_end]
         s_batch = support[s_start:s_end]
-        if q_batch.shape[0] == 0 or s_batch.shape[0] == 0:
-            indices.append(torch.zeros((q_batch.shape[0], k), device=query.device, dtype=torch.long))
-            distances.append(torch.zeros((q_batch.shape[0], k), device=query.device))
+        if q_batch.shape[0] == 0:
+            indices.append(torch.zeros((0, k), device=query.device, dtype=torch.long))
+            distances.append(torch.zeros((0, k), device=query.device))
+        elif s_batch.shape[0] == 0:
+            # No support points, return -1 indices or similar
+            indices.append(torch.full((q_batch.shape[0], k), -1, device=query.device, dtype=torch.long))
+            distances.append(torch.full((q_batch.shape[0], k), float('inf'), device=query.device))
         else:
             dist = torch.cdist(q_batch, s_batch)
-            d, idx = dist.topk(min(k, s_batch.shape[0]), dim=1, largest=False)
+            actual_k = min(k, s_batch.shape[0])
+            d, idx = dist.topk(actual_k, dim=1, largest=False)
+            if actual_k < k:
+                # Pad with -1 if not enough neighbors
+                idx = F.pad(idx, (0, k - actual_k), value=-1)
+                d = F.pad(d, (0, k - actual_k), value=float('inf'))
             indices.append(idx + s_start)
             distances.append(d)
         q_start, s_start = q_end, s_end
@@ -76,13 +88,16 @@ class CosineScheduler(object):
         self.final_value = final_value
         self.total_iters = total_iters
         warmup_schedule = np.linspace(start_value, base_value, warmup_iters)
-        iters = np.arange(total_iters - warmup_iters)
-        schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
+        iters = np.arange(max(0, total_iters - warmup_iters))
+        if len(iters) > 0:
+            schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
+        else:
+            schedule = np.array([])
         self.schedule = np.concatenate((warmup_schedule, schedule))
         self.iter = 0
 
     def step(self):
-        value = self.schedule[self.iter] if self.iter < self.total_iters else self.final_value
+        value = self.schedule[self.iter] if self.iter < len(self.schedule) else self.final_value
         self.iter += 1
         return value
 
@@ -106,6 +121,11 @@ class OnlineCluster(nn.Module):
             if m.bias is not None: nn.init.constant_(m.bias, 0)
 
     def forward(self, feat, return_embed=False):
+        if feat.shape[0] == 0:
+            logits = torch.zeros((0, self.prototype.weight_v.shape[0]), device=feat.device)
+            if return_embed:
+                return logits, feat
+            return logits
         feat = self.mlp(feat)
         feat = F.normalize(feat, dim=-1, p=2)
         logits = self.prototype(feat)
@@ -136,19 +156,27 @@ class Sonata(PointModule):
 
     @staticmethod
     def sinkhorn_knopp(feat, temp, num_iter=3):
+        if feat.shape[0] == 0:
+            return torch.zeros_like(feat)
         q = torch.exp(feat / temp).t()
         k, n = q.shape
         sum_q = q.sum()
+        if sum_q == 0:
+            return torch.zeros_like(q).t()
         q /= sum_q
         for _ in range(num_iter):
-            q /= q.sum(dim=1, keepdim=True)
+            row_sum = q.sum(dim=1, keepdim=True)
+            q /= (row_sum + 1e-12)
             q /= k
-            q /= q.sum(dim=0, keepdim=True)
+            col_sum = q.sum(dim=0, keepdim=True)
+            q /= (col_sum + 1e-12)
             q /= n
         q *= n
         return q.t()
 
     def generate_mask(self, coord, offset, mask_size, mask_ratio):
+        if coord.shape[0] == 0:
+            return torch.zeros(0, dtype=torch.bool, device=coord.device)
         batch = offset2batch(offset)
         # Simplify: unique grid patches
         grid_coord = (coord // mask_size).int()
@@ -164,7 +192,11 @@ class Sonata(PointModule):
             if "pooling_parent" not in point.keys(): break
             parent = point.pop("pooling_parent")
             inverse = point.pop("pooling_inverse")
-            parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+            if point.feat.shape[0] > 0:
+                parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+            else:
+                # Handle case where point.feat is empty but inverse exists
+                parent.feat = torch.cat([parent.feat, torch.zeros((parent.feat.shape[0], point.feat.shape[1]), device=parent.feat.device)], dim=-1)
             point = parent
         return point
 
@@ -205,27 +237,33 @@ class Sonata(PointModule):
         mask_loss_reduced = mask_loss[mask].mean() if mask.any() else torch.tensor(0.0, device=mask_loss.device)
 
         # Local Loss (match to principal global view)
-        with torch.no_grad():
-            principal_mask = t_point.batch % self.num_global_view == 0
-            t_principal_coord = t_point.origin_coord[principal_mask]
-            t_principal_target = t_target[principal_mask]
-            t_principal_offset = t_point.offset[0::self.num_global_view]
-            if self.num_global_view > 1:
-                t_counts = offset2bincount(t_point.offset)
-                t_principal_counts = t_counts[0::self.num_global_view]
-                t_principal_offset = torch.cumsum(t_principal_counts, dim=0)
-            t_support_offset = t_principal_offset.repeat_interleave(self.num_local_view)
-            match_idx, _ = knn_query(1, s_l_point.origin_coord, s_l_point.offset, 
-                                     t_principal_coord, t_support_offset)
-            l_target = t_principal_target[match_idx.squeeze(-1)]
+        local_loss = torch.tensor(0.0, device=mask_loss.device)
+        if s_l_point.feat.shape[0] > 0 and t_target.shape[0] > 0:
+            with torch.no_grad():
+                principal_mask = t_point.batch % self.num_global_view == 0
+                t_principal_coord = t_point.origin_coord[principal_mask]
+                t_principal_target = t_target[principal_mask]
+                t_principal_offset = t_point.offset[0::self.num_global_view]
+                if self.num_global_view > 1:
+                    t_counts = offset2bincount(t_point.offset)
+                    t_principal_counts = t_counts[0::self.num_global_view]
+                    t_principal_offset = torch.cumsum(t_principal_counts, dim=0)
+                t_support_offset = t_principal_offset.repeat_interleave(self.num_local_view)
+                
+                if t_principal_coord.shape[0] > 0:
+                    match_idx, _ = knn_query(1, s_l_point.origin_coord, s_l_point.offset, 
+                                            t_principal_coord, t_support_offset)
+                    # Filter out invalid indices (-1)
+                    valid_mask = (match_idx.squeeze(-1) >= 0)
+                    if valid_mask.any():
+                        l_target = t_principal_target[match_idx.squeeze(-1)[valid_mask]]
+                        local_loss = -torch.sum(l_target * F.log_softmax(s_l_logits[valid_mask] / student_temp, dim=-1), dim=-1).mean()
         
-        local_loss = -torch.sum(l_target * F.log_softmax(s_l_logits / student_temp, dim=-1), dim=-1).mean()
-
         # Monitoring quantities
         with torch.no_grad():
-            teacher_entropy = -torch.sum(t_target * torch.log(t_target + 1e-12), dim=-1).mean()
+            teacher_entropy = -torch.sum(t_target * torch.log(t_target + 1e-12), dim=-1).mean() if t_target.shape[0] > 0 else torch.tensor(0.0, device=mask_loss.device)
             s_g_probs = F.softmax(s_g_logits / student_temp, dim=-1)
-            student_entropy = -torch.sum(s_g_probs * torch.log(s_g_probs + 1e-12), dim=-1).mean()
+            student_entropy = -torch.sum(s_g_probs * torch.log(s_g_probs + 1e-12), dim=-1).mean() if s_g_probs.shape[0] > 0 else torch.tensor(0.0, device=mask_loss.device)
             # KL Divergence between teacher and student on masked points
             kl_div = F.kl_div(s_g_log_probs[mask], t_target[mask], reduction='batchmean') if mask.any() else torch.tensor(0.0, device=mask_loss.device)
 
