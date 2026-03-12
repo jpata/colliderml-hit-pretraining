@@ -52,8 +52,8 @@ scan = "python scripts/scan_params.py"
 snakemake = "snakemake"
 run-snakemake = "snakemake --workflow-profile $PROFILE --cores $CORES"
 dry-run = "snakemake --dry-run"
-download-ttbar = "colliderml download --channels ttbar --pileup pu0 --objects particles,tracker_hits,calo_hits,tracks --max-events 10000"
-download-ggf = "colliderml download --channels ggf --pileup pu0 --objects particles,tracker_hits,calo_hits,tracks --max-events 10000"
+download-ttbar = "colliderml download --channels ttbar --pileup pu0 --objects particles,tracker_hits,calo_hits,tracks --max-events 50000"
+download-ggf = "colliderml download --channels ggf --pileup pu0 --objects particles,tracker_hits,calo_hits,tracks --max-events 50000"
 download = { depends-on = ["download-ttbar", "download-ggf"] }
 
 [dependencies]
