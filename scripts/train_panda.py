@@ -571,7 +571,7 @@ class PandaTrainer:
         base_ds = NeighborhoodCalorimeterDataset(num_hits=self.args.num_hits, max_events=self.args.max_events, verbose=False)
         wrapper_ds = MultiViewDatasetWrapper(base_ds, n_global_views=self.args.n_global_views, n_local_views=self.args.n_local_views)
         dataloader = DataLoader(wrapper_ds, batch_size=self.args.batch_size, shuffle=False, 
-                                num_workers=4, collate_fn=panda_collate_fn, persistent_workers=True)
+                                num_workers=8, collate_fn=panda_collate_fn, persistent_workers=True, prefetch_factor=4)
         
         total_steps = self.args.epochs * len(dataloader)
         mask_size_sched = CosineScheduler(0.01, 0.05, total_steps, start_value=0.01, warmup_iters=int(0.05*total_steps))

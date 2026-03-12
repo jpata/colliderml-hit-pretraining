@@ -1,7 +1,7 @@
-NUM_HITS_LIST = [512, 1024, 2048, 4096, 8192]
+NUM_HITS_LIST = [2048]
 EPOCHS = 20
-BATCH_SIZE = 4
-MAX_EVENTS = 1000
+BATCH_SIZE = 16
+MAX_EVENTS = 1000000
 
 rule all:
     input:
@@ -17,10 +17,10 @@ rule train_panda:
         max_events = MAX_EVENTS
     resources:
         slurm_partition="gpu",
-        gres="gpu:l40:1",
+        gres="gpu:a100:1",
         mem_mb=30000,
         runtime=600,
-        cpus_per_task=8
+        cpus_per_task=12
     shell:
         """
         env
